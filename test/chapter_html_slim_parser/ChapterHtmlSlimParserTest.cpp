@@ -1,4 +1,5 @@
 #include <Epub/Page.h>
+#include <Epub/math/MathCapture.h>
 #include <GfxRenderer.h>
 #include <gtest/gtest.h>
 
@@ -502,6 +503,118 @@ TEST_F(ChapterHtmlSlimParserTest, StablePageOffsetsCollapseClusteredWhitespace) 
   EXPECT_EQ(parser.currentTextBlock->wordReferenceOffsets[1], 6u);
   EXPECT_EQ(parser.referenceTextOffset, 10u);
   EXPECT_TRUE(parser.referenceWhitespacePending);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, DisplaysNamespacedMathAsGlyphsAndAFractionRule) {
+  const XML_Char* rootAttributes[] = {"xmlns:m", "http://www.w3.org/1998/Math/MathML", nullptr};
+  const XML_Char* displayAttributes[] = {"display", "block", nullptr};
+  renderer.textAdvancePerChar = 6;
+  ChapterHtmlSlimParser::startElement(&parser, "div", rootAttributes);
+  ChapterHtmlSlimParser::startElement(&parser, "m:math", displayAttributes);
+  ChapterHtmlSlimParser::startElement(&parser, "m:mfrac", nullptr);
+  for (const char* digit : {"1", "2"}) {
+    ChapterHtmlSlimParser::startElement(&parser, "m:mn", nullptr);
+    ChapterHtmlSlimParser::characterData(&parser, digit, 1);
+    ChapterHtmlSlimParser::endElement(&parser, "m:mn");
+  }
+  ChapterHtmlSlimParser::endElement(&parser, "m:mfrac");
+  ChapterHtmlSlimParser::endElement(&parser, "m:math");
+  ChapterHtmlSlimParser::endElement(&parser, "div");
+
+  ASSERT_TRUE(parser.currentPage);
+  ASSERT_EQ(parser.currentPage->elements.size(), 1u);
+  ASSERT_EQ(parser.currentPage->elements[0]->getTag(), TAG_PageMath);
+  const auto& drawing = static_cast<PageMath&>(*parser.currentPage->elements[0]).getDrawing();
+  EXPECT_GT(drawing.ascent, 0);
+  EXPECT_GT(drawing.descent, 0);
+  EXPECT_NE(std::find_if(drawing.commands.get(), drawing.commands.get() + drawing.commandCount,
+                         [](const auto& command) { return command.type == mathml::DrawType::Rule; }),
+            drawing.commands.get() + drawing.commandCount);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, InlineMathKeepsPunctuationAndSourceOffsets) {
+  renderer.textAdvancePerChar = 6;
+  parser.trackReferenceCharacters = true;
+  parser.currentTextBlock = std::make_unique<ParsedText>(false, false, false, false, false, 0, BlockStyle{}, true);
+  const XML_Char* root[] = {"xmlns", "http://www.w3.org/1998/Math/MathML", nullptr};
+  ChapterHtmlSlimParser::characterData(&parser, "Before ", 7);
+  ChapterHtmlSlimParser::startElement(&parser, "math", root);
+  ChapterHtmlSlimParser::startElement(&parser, "mi", nullptr);
+  ChapterHtmlSlimParser::characterData(&parser, "x", 1);
+  ChapterHtmlSlimParser::characterData(&parser, "y", 1);
+  ChapterHtmlSlimParser::endElement(&parser, "mi");
+  ChapterHtmlSlimParser::endElement(&parser, "math");
+  ChapterHtmlSlimParser::characterData(&parser, ", after", 7);
+  parser.flushPartWordBuffer();
+
+  ASSERT_EQ(parser.currentTextBlock->size(), 4u);
+  EXPECT_TRUE(isInlineObjectToken(parser.currentTextBlock->words[1]));
+  EXPECT_TRUE(parser.currentTextBlock->wordContinues[2]);
+  EXPECT_EQ(parser.currentTextBlock->words[2], ",");
+  EXPECT_EQ(parser.visibleTextOffset, 16u);
+  EXPECT_EQ(parser.referenceTextOffset, 16u);
+  parser.makePages();
+  ASSERT_TRUE(parser.currentPage);
+  ASSERT_EQ(parser.currentPage->elements.size(), 2u);
+  EXPECT_EQ(parser.currentPage->elements.back()->getTag(), TAG_PageMath);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, KeepsListMarkerWithDisplayMathAcrossPageBreak) {
+  renderer.textAdvancePerChar = 6;
+  parser.viewportHeight = 64;
+  parser.currentPage = std::make_unique<Page>();
+  parser.currentPage->elements.push_back(std::make_unique<PageHorizontalRule>(10, 1, 0, 0));
+  parser.currentPageNextY = 60;
+  std::unique_ptr<Page> previous;
+  parser.completePageFn = [&](std::unique_ptr<Page> page, uint16_t, uint16_t, uint32_t, uint32_t) {
+    previous = std::move(page);
+  };
+  const XML_Char* root[] = {"xmlns", "http://www.w3.org/1998/Math/MathML", "display", "block", nullptr};
+  ChapterHtmlSlimParser::startElement(&parser, "ol", nullptr);
+  ChapterHtmlSlimParser::startElement(&parser, "li", nullptr);
+  ChapterHtmlSlimParser::startElement(&parser, "math", root);
+  ChapterHtmlSlimParser::startElement(&parser, "mi", nullptr);
+  ChapterHtmlSlimParser::characterData(&parser, "x", 1);
+  ChapterHtmlSlimParser::endElement(&parser, "mi");
+  ChapterHtmlSlimParser::endElement(&parser, "math");
+  parser.makePages();
+
+  ASSERT_TRUE(previous);
+  ASSERT_EQ(previous->elements.size(), 1u);
+  ASSERT_EQ(parser.currentPage->elements.size(), 2u);
+  ASSERT_EQ(parser.currentPage->elements[0]->getTag(), TAG_PageLine);
+  EXPECT_STREQ(static_cast<const PageLine&>(*parser.currentPage->elements[0]).getBlock()->wordText(0), "1.");
+  EXPECT_EQ(parser.currentPage->elements[1]->getTag(), TAG_PageMath);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, OversizedMathUsesAlttextAndResumesText) {
+  const XML_Char* root[] = {"xmlns", "http://www.w3.org/1998/Math/MathML", "alttext", "replacement", nullptr};
+  ChapterHtmlSlimParser::startElement(&parser, "math", root);
+  for (int i = 0; i < 150; ++i) {
+    ChapterHtmlSlimParser::startElement(&parser, "mi", nullptr);
+    ChapterHtmlSlimParser::characterData(&parser, "x", 1);
+    ChapterHtmlSlimParser::endElement(&parser, "mi");
+  }
+  ChapterHtmlSlimParser::endElement(&parser, "math");
+  ChapterHtmlSlimParser::characterData(&parser, " following ", 11);
+  ASSERT_EQ(parser.currentTextBlock->size(), 2u);
+  EXPECT_EQ(parser.currentTextBlock->words[0], "replacement");
+  EXPECT_EQ(parser.currentTextBlock->words[1], "following");
+  EXPECT_EQ(parser.visibleTextOffset, 161u);
+}
+
+TEST(MathNamespaceTest, RebindingAndClearingDoNotLeakToSiblings) {
+  mathml::NamespaceScope scope;
+  const XML_Char* root[] = {"xmlns:m", "http://www.w3.org/1998/Math/MathML", nullptr};
+  const XML_Char* foreign[] = {"xmlns:m", "urn:foreign", nullptr};
+  scope.enter(root);
+  EXPECT_EQ(scope.localMathName("m:math"), "math");
+  scope.enter(foreign);
+  EXPECT_TRUE(scope.localMathName("m:math").empty());
+  scope.leave();
+  EXPECT_EQ(scope.localMathName("m:mi"), "mi");
+  scope.leave();
+  EXPECT_TRUE(scope.localMathName("m:mi").empty());
 }
 
 TEST_F(ChapterHtmlSlimParserTest, StablePageOffsetsResumeAfterNestedExcludedMarkup) {

@@ -9,6 +9,7 @@
 #include <GfxRenderer.h>
 
 #include <algorithm>
+#include <cstring>
 
 std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(const std::string&, bool) { return {}; }
 
@@ -27,11 +28,25 @@ TextBlock::TextBlock(const std::vector<std::string>& words, const std::vector<in
                      const std::vector<uint16_t>&, const std::vector<uint16_t>&, const std::vector<uint8_t>&,
                      const std::vector<bool>&, const BlockStyle& blockStyle, std::vector<std::string> rubyTexts)
     : blockStyle(blockStyle), numWords(static_cast<uint16_t>(words.size())), rubyTexts(std::move(rubyTexts)) {
-  if (wordXpos.empty()) return;
-  arena = std::make_unique<uint8_t[]>(wordXpos.size() * sizeof(int16_t));
-  auto* positions = reinterpret_cast<int16_t*>(arena.get());
+  if (words.empty()) return;
+  for (const auto& word : words) textBytes += static_cast<uint16_t>(word.size() + 1);
+  const size_t offsetBytes = words.size() * sizeof(uint16_t);
+  const size_t positionBytes = words.size() * sizeof(int16_t);
+  arena = std::make_unique<uint8_t[]>(offsetBytes + positionBytes + textBytes);
+  auto* offsets = reinterpret_cast<uint16_t*>(arena.get());
+  auto* positions = reinterpret_cast<int16_t*>(arena.get() + offsetBytes);
+  auto* text = reinterpret_cast<char*>(arena.get() + offsetBytes + positionBytes);
   std::copy(wordXpos.begin(), wordXpos.end(), positions);
+  uint16_t offset = 0;
+  for (size_t i = 0; i < words.size(); ++i) {
+    offsets[i] = offset;
+    const size_t length = words[i].size() + 1;
+    std::memcpy(text + offset, words[i].c_str(), length);
+    offset += static_cast<uint16_t>(length);
+  }
+  textOffArr = offsets;
   xposArr = positions;
+  textArr = text;
 }
 bool TextBlock::hasRuby() const { return false; }
 
@@ -59,7 +74,7 @@ bool CompactTableLayout::beginRow() { return true; }
 bool CompactTableLayout::beginCell(bool, uint8_t, uint32_t, const BlockStyle&) { return true; }
 bool CompactTableLayout::appendWord(std::string_view, EpdFontFamily::Style, bool, bool, uint8_t) { return true; }
 bool CompactTableLayout::endCell(const std::vector<std::pair<int, FootnoteEntry>>&) { return true; }
-CompactTableLayout::RowResult CompactTableLayout::finishRow(TableFragmentRow&, std::vector<std::shared_ptr<TextBlock>>&,
+CompactTableLayout::RowResult CompactTableLayout::finishRow(TableFragmentRow&, std::vector<TableCellLine>&,
                                                             std::vector<FootnoteEntry>&, uint32_t&) {
   return RowResult::Ok;
 }
@@ -68,5 +83,7 @@ void PageLine::render(GfxRenderer&, int, int, int, bool) {}
 bool PageLine::serialize(FsFile&) { return false; }
 void PageHorizontalRule::render(GfxRenderer&, int, int, int, bool) {}
 bool PageHorizontalRule::serialize(FsFile&) { return false; }
+void PageMath::render(GfxRenderer&, int, int, int, bool) {}
+bool PageMath::serialize(FsFile&) { return false; }
 void PageTableFragment::render(GfxRenderer&, int, int, int, bool) {}
 bool PageTableFragment::serialize(FsFile&) { return false; }

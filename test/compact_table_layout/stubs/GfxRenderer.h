@@ -30,4 +30,6 @@ class GfxRenderer {
   }
 
   int getSpaceWidth(int, EpdFontFamily::Style) const { return 1; }
+  int getFontIdForSize(int id, uint8_t) const { return id; }
+  int getFontAscenderSize(int) const { return 7; }
 };

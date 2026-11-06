@@ -1,10 +1,18 @@
 add_executable(ChapterHtmlSlimParserTest
   ChapterHtmlSlimParserTest.cpp
+  MathLayoutTest.cpp
   ParserLinkStubs.cpp
   ${REPO_ROOT}/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
   ${REPO_ROOT}/lib/Epub/Epub/css/CssParser.cpp
   ${REPO_ROOT}/lib/Epub/Epub/ParsedText.cpp
   ${REPO_ROOT}/lib/Epub/Epub/htmlEntities.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/math/MathLayout.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/math/MathFont.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/math/MathFontAsset.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/tables/TableCellLine.cpp
+  ${REPO_ROOT}/lib/InflateReader/InflateReader.cpp
+  ${REPO_ROOT}/lib/uzlib/src/tinflate.c
+  ${REPO_ROOT}/lib/uzlib/src/uzlib_checksums.c
   ${REPO_ROOT}/lib/Utf8/Utf8.cpp
 )
 
@@ -16,10 +24,12 @@ target_include_directories(ChapterHtmlSlimParserTest PRIVATE
   ${REPO_ROOT}/lib/Epub/Epub/parsers
   ${REPO_ROOT}/lib/Epub/Epub/css
   ${REPO_ROOT}/lib/EpdFont
+  ${REPO_ROOT}/lib/InflateReader
   ${REPO_ROOT}/lib/Memory
   ${REPO_ROOT}/lib/MiniBidi
   ${REPO_ROOT}/lib/Utf8
   ${REPO_ROOT}/lib/XmlParserUtils
+  ${REPO_ROOT}/lib/uzlib/src
   ${REPO_ROOT}/lib/Epub/Epub/tables
 )
 

@@ -10,6 +10,7 @@ struct BlockStyle {
   int16_t marginRight = 0;
   int16_t paddingLeft = 0;
   int16_t paddingRight = 0;
+  uint8_t fontSize = 0;
   bool isRtl = false;
 
   int16_t leftInset() const { return marginLeft + paddingLeft; }

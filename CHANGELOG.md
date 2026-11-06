@@ -5,6 +5,14 @@ records only its own additions. Each release states the CrossInk version it is b
 on; for everything inherited from upstream, see the
 [CrossInk changelog](https://github.com/uxjulia/CrossInk/blob/main/CHANGELOG.md).
 
+## Unreleased
+
+Based on CrossInk v1.6.1.
+
+### Added
+
+- EPUBs can display inline and standalone MathML equations using a bundled math font.
+
 ## [v1.6.1+bookorbit.4] - 2026-10-30
 
 Based on CrossInk v1.6.1.

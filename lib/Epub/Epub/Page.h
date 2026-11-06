@@ -12,12 +12,15 @@
 #include "PageCountEstimator.h"
 #include "blocks/ImageBlock.h"
 #include "blocks/TextBlock.h"
+#include "math/MathDrawing.h"
+#include "tables/TableCellLine.h"
 
 enum PageElementTag : uint8_t {
   TAG_PageLine = 1,
   TAG_PageImage = 2,  // New tag
   TAG_PageTableFragment = 3,
   TAG_PageHorizontalRule = 4,
+  TAG_PageMath = 5,
 };
 
 // represents something that has been added to a page
@@ -77,12 +80,32 @@ class PageHorizontalRule final : public PageElement {
   static std::unique_ptr<PageHorizontalRule> deserialize(FsFile& file);
 };
 
+class PageMath final : public PageElement {
+  mathml::Drawing drawing;
+
+ public:
+  PageMath(mathml::Drawing drawing, const int16_t xPos, const int16_t yPos)
+      : PageElement(xPos, yPos), drawing(std::move(drawing)) {}
+
+  const mathml::Drawing& getDrawing() const { return drawing; }
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
+  bool serialize(FsFile& file) override;
+  PageElementTag getTag() const override { return TAG_PageMath; }
+  static std::unique_ptr<PageMath> deserialize(FsFile& file);
+};
+
 struct TableFragmentCell {
   static constexpr uint8_t MAX_SERIALIZED_LINES = 64;
   bool isHeader = false;
   uint8_t colSpan = 1;
-  std::vector<std::shared_ptr<TextBlock>> lines;
+  std::vector<TableCellLine> lines;
 
+  int contentHeight(const int lineHeight) const {
+    if (lines.empty()) return lineHeight;
+    int height = 0;
+    for (const auto& line : lines) height += line.height(lineHeight);
+    return height;
+  }
   bool serialize(FsFile& file) const;
   static bool deserialize(FsFile& file, TableFragmentCell& outCell);
 };

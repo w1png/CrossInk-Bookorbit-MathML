@@ -15,8 +15,8 @@
 #include <limits>
 #include <vector>
 
-#include "InlineImageToken.h"
 #include "hyphenation/Hyphenator.h"
+#include "math/MathDrawing.h"
 
 constexpr int MAX_COST = std::numeric_limits<int>::max();
 
@@ -53,6 +53,10 @@ uint32_t firstCodepoint(const std::string& word) {
   }
 }
 
+bool closesInlineMath(const std::string& left, const std::string& right) {
+  return isInlineMathToken(left) && isClosingPunctuationForWrap(firstCodepoint(right));
+}
+
 // Returns the last rendered codepoint of a word by scanning backward for the start of the last UTF-8 sequence.
 uint32_t lastCodepoint(const std::string& word) {
   size_t end = word.size();
@@ -72,47 +76,7 @@ uint32_t lastCodepoint(const std::string& word) {
 
 bool containsSoftHyphen(const std::string& word) { return word.find(SOFT_HYPHEN_UTF8) != std::string::npos; }
 
-bool isNoBreakBeforeCjkPunctuation(const uint32_t cp) {
-  switch (cp) {
-    case '.':
-    case ',':
-    case ':':
-    case ';':
-    case '!':
-    case '?':
-    case ')':
-    case ']':
-    case '}':
-    case 0x00BB:  // »
-    case 0x2019:  // ’
-    case 0x201D:  // ”
-    case 0x3001:  // 、
-    case 0x3002:  // 。
-    case 0x3009:  // 〉
-    case 0x300B:  // 》
-    case 0x300D:  // 」
-    case 0x300F:  // 』
-    case 0x3011:  // 】
-    case 0x3015:  // 〕
-    case 0x3017:  // 〗
-    case 0x3019:  // 〙
-    case 0x301B:  // 〛
-    case 0xFF01:  // ！
-    case 0xFF09:  // ）
-    case 0xFF0C:  // ，
-    case 0xFF0E:  // ．
-    case 0xFF1A:  // ：
-    case 0xFF1B:  // ；
-    case 0xFF1F:  // ？
-    case 0xFF3D:  // ］
-    case 0xFF5D:  // ｝
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isClosingPunctuationForJustify(const uint32_t cp) { return isNoBreakBeforeCjkPunctuation(cp); }
+bool isClosingPunctuationForJustify(const uint32_t cp) { return isClosingPunctuationForWrap(cp); }
 
 bool isNoBreakAfterCjkPunctuation(const uint32_t cp) {
   switch (cp) {
@@ -164,7 +128,7 @@ uint32_t countCodepoints(const std::string_view text) {
 
 bool cjkBoundaryAllowsBreak(const uint32_t leftCp, const uint32_t rightCp) {
   if (!utf8IsCjkBreakable(leftCp) && !utf8IsCjkBreakable(rightCp)) return false;
-  if (isNoBreakAfterCjkPunctuation(leftCp) || isNoBreakBeforeCjkPunctuation(rightCp)) return false;
+  if (isNoBreakAfterCjkPunctuation(leftCp) || isClosingPunctuationForWrap(rightCp)) return false;
   if (utf8IsCombiningMark(rightCp) || utf8IsVariationSelector(rightCp)) return false;
   return true;
 }
@@ -378,8 +342,8 @@ int measureFocusRunOffset(const GfxRenderer& renderer, const int fontId, const s
 uint16_t measureTokenWidth(const GfxRenderer& renderer, const int fontId, const std::string& word,
                            const EpdFontFamily::Style style, const uint8_t focusBoundary,
                            const bool appendHyphen = false) {
-  uint16_t imageId, imageWidth, imageHeight;
-  if (parseInlineImageToken(word.c_str(), imageId, imageWidth, imageHeight)) return imageWidth;
+  InlineObjectToken object;
+  if (parseInlineObjectToken(word, object)) return object.width;
   if (focusBoundary == 0 || focusBoundary >= word.size() || appendHyphen || containsSoftHyphen(word)) {
     return measureWordWidth(renderer, fontId, word, style, appendHyphen);
   }
@@ -422,9 +386,7 @@ int guideDotWordSpacingExtra(const GfxRenderer& renderer, const int fontId, cons
 int naturalGapBeforeToken(const GfxRenderer& renderer, const int fontId, const std::string& leftWord,
                           const std::string& rightWord, const EpdFontFamily::Style leftStyle, const bool continues,
                           const bool noSpaceBefore, const bool guideDotBefore, const uint8_t wordSpacing) {
-  uint16_t imageId, imageWidth, imageHeight;
-  const bool imageEdge = parseInlineImageToken(leftWord.c_str(), imageId, imageWidth, imageHeight) ||
-                         parseInlineImageToken(rightWord.c_str(), imageId, imageWidth, imageHeight);
+  const bool objectEdge = isInlineObjectToken(leftWord) || isInlineObjectToken(rightWord);
   if (guideDotBefore) {
     const int extraGap = guideDotWordSpacingExtra(renderer, fontId, leftWord, rightWord, leftStyle, wordSpacing);
     return guideDotNaturalGap(renderer, fontId, leftWord, rightWord, leftStyle) + extraGap;
@@ -433,10 +395,10 @@ int naturalGapBeforeToken(const GfxRenderer& renderer, const int fontId, const s
     return 0;
   }
   if (continues) {
-    if (imageEdge) return 0;
+    if (objectEdge) return 0;
     return renderer.getKerning(fontId, lastCodepoint(leftWord), firstCodepoint(rightWord), leftStyle);
   }
-  if (imageEdge) {
+  if (objectEdge) {
     const int gap = renderer.getSpaceWidth(fontId, leftStyle);
     return gap + wordSpacingExtraFromGap(gap, wordSpacing);
   }
@@ -447,10 +409,7 @@ int naturalGapBeforeToken(const GfxRenderer& renderer, const int fontId, const s
 
 size_t gapSlotsBeforeToken(const std::string& leftWord, const std::string& rightWord, const bool continues,
                            const bool noSpaceBefore, const bool guideDotBefore) {
-  uint16_t imageId, imageWidth, imageHeight;
-  if ((continues || noSpaceBefore) && (parseInlineImageToken(leftWord.c_str(), imageId, imageWidth, imageHeight) ||
-                                       parseInlineImageToken(rightWord.c_str(), imageId, imageWidth, imageHeight)))
-    return 0;
+  if ((continues || noSpaceBefore) && (isInlineObjectToken(leftWord) || isInlineObjectToken(rightWord))) return 0;
   if (guideDotBefore) {
     return guideDotGapSlots(rightWord);
   }
@@ -670,10 +629,10 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
   bool effectiveAttachToPrevious = attachToPrevious;
   bool effectiveNoSpaceBefore = false;
-  uint16_t imageId, imageWidth, imageHeight;
-  if (attachToPrevious && !words.empty() &&
-      parseInlineImageToken(words.back().c_str(), imageId, imageWidth, imageHeight)) {
-    // The following text may wrap after the image without gaining a space.
+  if (attachToPrevious && !words.empty() && isInlineObjectToken(words.back()) &&
+      !closesInlineMath(words.back(), word)) {
+    // The following text may wrap after the object without gaining a space.
+    // Closing punctuation stays with its equation.
     effectiveAttachToPrevious = false;
     effectiveNoSpaceBefore = true;
   }
@@ -689,7 +648,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
   // GUIDE READING: store a virtual middle dot (U+00B7) before the next real token.
   if (guideReadingEnabled && !effectiveAttachToPrevious && !effectiveNoSpaceBefore && !words.empty() &&
-      !parseInlineImageToken(words.back().c_str(), imageId, imageWidth, imageHeight)) {
+      !isInlineObjectToken(words.back())) {
     guideDotBeforeNextToken = true;
   }
 
@@ -819,10 +778,29 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 void ParsedText::addInlineImage(const uint16_t id, const uint16_t width, const uint16_t height,
                                 const bool attachToPrevious, const uint32_t visibleTextOffset,
                                 const uint32_t referenceTextOffset) {
+  addInlineObject(makeInlineImageToken(id, width, height), attachToPrevious, visibleTextOffset, referenceTextOffset);
+}
+
+bool ParsedText::addInlineMath(const uint16_t id, const uint16_t width, const uint16_t ascent, const uint16_t descent,
+                               const bool attachToPrevious, const uint32_t visibleTextOffset,
+                               const uint32_t referenceTextOffset) {
+  const uint32_t height = static_cast<uint32_t>(ascent) + descent;
+  if (width > mathml::Drawing::MAX_DIMENSION || height > mathml::Drawing::MAX_DIMENSION) {
+    LOG_ERR("PTX", "Invalid inline MathML dimensions (%u x %u)", width, height);
+    return false;
+  }
+  addInlineObject(makeInlineMathToken(id, width, static_cast<uint16_t>(height), ascent), attachToPrevious,
+                  visibleTextOffset, referenceTextOffset);
+  return true;
+}
+
+void ParsedText::addInlineObject(std::string token, const bool attachToPrevious, const uint32_t visibleTextOffset,
+                                 const uint32_t referenceTextOffset) {
   reserveTokenCapacity(1);
-  words.push_back(makeInlineImageToken(id, width, height));
+  words.push_back(std::move(token));
+  hasInlineObjects_ = true;
   wordStyles.push_back(EpdFontFamily::REGULAR);
-  // Image edges are legal wrap points even with no source whitespace.
+  // Object edges are legal wrap points even with no source whitespace.
   wordContinues.push_back(false);
   wordNoSpaceBefore.push_back(attachToPrevious);
   wordFocusBoundary.push_back(0);
@@ -1001,12 +979,14 @@ bool ParsedText::layoutAndExtractLines(
 
 bool ParsedText::layoutAndExtractLinesPreservingSource(
     const GfxRenderer& renderer, const int fontId, const uint16_t viewportWidth,
-    const std::function<void(std::shared_ptr<TextBlock>)>& processLine, const bool allowCharacterBreaks) const {
+    const std::function<void(std::shared_ptr<TextBlock>, const std::vector<InlineObjectPlacement>&)>& processLine,
+    const bool allowCharacterBreaks) const {
   ParsedText layoutProbe(*this);
   layoutProbe.allowCharacterBreaks_ = allowCharacterBreaks;
   return layoutProbe.layoutAndExtractLines(
-      renderer, fontId, viewportWidth, [&processLine](std::shared_ptr<TextBlock> line, const uint32_t, const uint32_t) {
-        processLine(std::move(line));
+      renderer, fontId, viewportWidth,
+      [&processLine, &layoutProbe](std::shared_ptr<TextBlock> line, const uint32_t, const uint32_t) {
+        processLine(std::move(line), layoutProbe.currentLineObjects());
       });
 }
 
@@ -1301,12 +1281,9 @@ bool ParsedText::computeLineBreaks(Arena& scratchArena, const GfxRenderer& rende
     // This prevents cascade failure where one oversized word breaks all preceding words
     if (dp[i] == MAX_COST) {
       ans[i] = i;  // Just this word on its own line
+      if (nextTokenAttaches(i, totalWordCount) && closesInlineMath(words[i], words[i + 1])) ++ans[i];
       // Inherit cost from next word to allow subsequent words to find valid configurations
-      if (i + 1 < static_cast<int>(totalWordCount)) {
-        dp[i] = dp[i + 1];
-      } else {
-        dp[i] = 0;
-      }
+      dp[i] = ans[i] + 1 < totalWordCount ? dp[ans[i] + 1] : 0;
     }
   }
 
@@ -1392,6 +1369,10 @@ bool ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& renderer, const 
     while (currentIndex > lineStart + 1 && currentTokenAttaches(currentIndex)) {
       --currentIndex;
     }
+    if (currentIndex == lineStart + 1 && currentTokenAttaches(currentIndex) &&
+        closesInlineMath(words[lineStart], words[currentIndex])) {
+      ++currentIndex;
+    }
 
     if (!lineBreakIndices.push_back(currentIndex)) {
       LOG_ERR("PTX", "OOM growing hyphenated line-break scratch");
@@ -1414,8 +1395,7 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   }
 
   const std::string& word = words[wordIndex];
-  uint16_t imageId, imageWidth, imageHeight;
-  if (parseInlineImageToken(word.c_str(), imageId, imageWidth, imageHeight)) return false;
+  if (isInlineObjectToken(word)) return false;
   const auto style = wordStyles[wordIndex];
   const int leadingPadding = inlinePaddingBefore(wordIndex);
 
@@ -1555,8 +1535,7 @@ bool ParsedText::splitTokenAtCodepointBoundary(const size_t wordIndex, const int
   }
 
   const std::string& word = words[wordIndex];
-  uint16_t imageId, imageWidth, imageHeight;
-  if (parseInlineImageToken(word.c_str(), imageId, imageWidth, imageHeight)) return false;
+  if (isInlineObjectToken(word)) return false;
   if (word.size() < 2) {
     return false;
   }
@@ -1958,7 +1937,7 @@ bool ParsedText::extractLine(Arena& scratchArena, const size_t breakIndex, const
   std::vector<uint16_t> outGuideDotXOffset;
   std::vector<uint8_t> outBackgroundBlack;
   std::vector<std::string> outRubyTexts;
-  lineImagesScratch.clear();
+  lineObjectsScratch.clear();
   auto& outHasSpaceBefore = lineHasSpaceBeforeScratch;
   outWords.reserve(lineWordCount);
   outXPos.reserve(lineWordCount);
@@ -1976,10 +1955,14 @@ bool ParsedText::extractLine(Arena& scratchArena, const size_t breakIndex, const
     outBackgroundBlack.reserve(lineWordCount);
   }
 
+  if (hasInlineObjects_ && lineObjectsScratch.capacity() < lineWordCount) {
+    const auto objectCount = std::count_if(lineWords.begin(), lineWords.end(), isInlineObjectToken);
+    if (objectCount > 0) lineObjectsScratch.reserve(static_cast<size_t>(objectCount));
+  }
   for (size_t i = 0; i < lineWordCount; i++) {
-    uint16_t imageId, imageWidth, imageHeight;
-    if (parseInlineImageToken(lineWords[i].c_str(), imageId, imageWidth, imageHeight)) {
-      lineImagesScratch.push_back({imageId, lineXPos[i], imageHeight});
+    InlineObjectToken object;
+    if (parseInlineObjectToken(lineWords[i], object)) {
+      lineObjectsScratch.push_back({object.id, lineXPos[i], object.height, object.ascent, object.kind});
       continue;
     }
     const uint8_t boundary = lineFocusBoundary[i];

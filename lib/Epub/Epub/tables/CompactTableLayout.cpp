@@ -80,6 +80,8 @@ uint16_t CompactTableLayout::measure(const uint16_t offset, const uint16_t lengt
   if (length == 0) return 0;
   const size_t end = static_cast<size_t>(offset) + length;
   if (end >= bufferCapacity_) return 0;
+  InlineObjectToken object;
+  if (parseInlineObjectToken(std::string_view(buffer_.get() + offset, length), object)) return object.width;
   const char saved = buffer_[end];
   buffer_[end] = '\0';
   const int width = renderer_.getTextAdvanceX(fontId_, buffer_.get() + offset, style);
@@ -190,66 +192,65 @@ bool CompactTableLayout::emitLine(std::array<LineToken, MAX_ROW_TOKENS>& line, c
                                   TableFragmentCell& output) {
   if (lineCount == 0) return true;
 
+  const auto objectCount = std::count_if(line.begin(), line.begin() + lineCount, [&](const auto& token) {
+    return isInlineObjectToken(std::string_view(buffer_.get() + token.offset, token.length));
+  });
+  if (objectCount > TableCellMath::MAX_OBJECTS) {
+    LOG_ERR("EHP", "Compact table line exceeds its inline MathML limit");
+    return false;
+  }
+  // A low-memory table reuses one bounded placement buffer only when it
+  // contains formulas. Keep it off the parser task stack.
+  if (objectCount > 0 && !mathPlacements_) {
+    mathPlacements_ = makeUniqueNoThrow<InlineObjectPlacement[]>(TableCellMath::MAX_OBJECTS);
+    if (!mathPlacements_) {
+      LOG_ERR("EHP", "Compact table MathML placement allocation failed");
+      allocationFailure_ = true;
+      return false;
+    }
+  }
+
   std::vector<std::string> words;
   std::vector<int16_t> xPositions;
   std::vector<EpdFontFamily::Style> styles;
   std::vector<uint8_t> flags;
   std::vector<bool> hasSpaceBefore;
-  words.reserve(lineCount);
-  xPositions.reserve(lineCount);
-  styles.reserve(lineCount);
-  flags.reserve(lineCount);
-  hasSpaceBefore.reserve(lineCount);
+  const size_t textCount = lineCount - objectCount;
+  words.reserve(textCount);
+  xPositions.reserve(textCount);
+  styles.reserve(textCount);
+  flags.reserve(textCount);
+  hasSpaceBefore.reserve(textCount);
   bool anyFlags = false;
-  for (uint16_t i = 0; i < lineCount; ++i) {
-    words.emplace_back(buffer_.get() + line[i].offset, line[i].length);
-    styles.push_back(line[i].style);
-    flags.push_back(line[i].flags);
-    hasSpaceBefore.push_back(i > 0 && !line[i].attachToPrevious);
-    anyFlags = anyFlags || line[i].flags != 0;
+  size_t mathCount = 0;
+  int x = style.isRtl ? lineWidth : 0;
+  const int remainingWidth = static_cast<int>(maxWidth) - lineWidth;
+  if (style.alignment == CssTextAlign::Center) {
+    x = style.isRtl ? (static_cast<int>(maxWidth) + lineWidth) / 2 : std::max(0, remainingWidth / 2);
+  } else if (style.alignment == CssTextAlign::Right || (style.isRtl && style.alignment == CssTextAlign::Justify)) {
+    x += style.isRtl ? remainingWidth : std::max(0, remainingWidth);
   }
-
-  if (style.isRtl) {
-    // TextBlock delegates glyph shaping to the renderer, but it still uses the
-    // stored x positions in logical word order. Walk from the right edge so
-    // RTL cells do not render their words in LTR order.
-    int rightEdge = lineWidth;
-    switch (style.alignment) {
-      case CssTextAlign::Center:
-        rightEdge = (static_cast<int>(maxWidth) + lineWidth) / 2;
-        break;
-      case CssTextAlign::Right:
-      case CssTextAlign::Justify:
-        rightEdge = maxWidth;
-        break;
-      default:
-        break;
+  // Keep word order logical and walk from the appropriate edge for the cell.
+  for (uint16_t i = 0; i < lineCount; ++i) {
+    const auto& token = line[i];
+    if (style.isRtl) x -= token.width;
+    const auto position = static_cast<int16_t>(std::clamp(x, 0, INT16_MAX));
+    const std::string_view value(buffer_.get() + token.offset, token.length);
+    InlineObjectToken object;
+    if (parseInlineObjectToken(value, object)) {
+      mathPlacements_[mathCount++] = {object.id, position, object.height, object.ascent, object.kind};
+    } else {
+      words.emplace_back(value);
+      xPositions.push_back(position);
+      styles.push_back(token.style);
+      flags.push_back(token.flags);
+      hasSpaceBefore.push_back(i > 0 && !token.attachToPrevious);
+      anyFlags = anyFlags || token.flags != 0;
     }
-    for (uint16_t i = 0; i < lineCount; ++i) {
-      rightEdge -= line[i].width;
-      xPositions.push_back(static_cast<int16_t>(std::clamp(rightEdge, 0, INT16_MAX)));
-      if (i + 1 < lineCount && !line[i + 1].attachToPrevious) {
-        rightEdge -= renderer_.getSpaceWidth(fontId_, line[i + 1].style);
-      }
-    }
-  } else {
-    int x = 0;
-    switch (style.alignment) {
-      case CssTextAlign::Center:
-        x = std::max(0, (static_cast<int>(maxWidth) - lineWidth) / 2);
-        break;
-      case CssTextAlign::Right:
-        x = std::max(0, static_cast<int>(maxWidth) - lineWidth);
-        break;
-      default:
-        break;
-    }
-    for (uint16_t i = 0; i < lineCount; ++i) {
-      xPositions.push_back(static_cast<int16_t>(std::clamp(x, 0, INT16_MAX)));
-      x += line[i].width;
-      if (i + 1 < lineCount && !line[i + 1].attachToPrevious) {
-        x += renderer_.getSpaceWidth(fontId_, line[i + 1].style);
-      }
+    if (!style.isRtl) x += token.width;
+    if (i + 1 < lineCount && !line[i + 1].attachToPrevious) {
+      const int gap = renderer_.getSpaceWidth(fontId_, line[i + 1].style);
+      x += style.isRtl ? -gap : gap;
     }
   }
 
@@ -260,7 +261,13 @@ bool CompactTableLayout::emitLine(std::array<LineToken, MAX_ROW_TOKENS>& line, c
     allocationFailure_ = true;
     return false;
   }
-  output.lines.emplace_back(std::move(owned));
+  auto& outputLine = output.lines.emplace_back(std::move(owned));
+  if (mathCount > 0 &&
+      !outputLine.setInlineMath(std::span(mathPlacements_.get(), mathCount), lineHeight_,
+                                renderer_.getFontAscenderSize(renderer_.getFontIdForSize(fontId_, style.fontSize)))) {
+    allocationFailure_ = true;
+    return false;
+  }
   return output.lines.size() <= TableFragmentCell::MAX_SERIALIZED_LINES;
 }
 
@@ -283,7 +290,8 @@ bool CompactTableLayout::appendLineToken(std::array<LineToken, MAX_ROW_TOKENS>& 
   return true;
 }
 
-bool CompactTableLayout::wrapCell(const Cell& cell, const uint16_t maxWidth, TableFragmentCell& output) {
+bool CompactTableLayout::wrapCell(const Cell& cell, const uint16_t maxWidth, TableFragmentCell& output,
+                                  const bool flatten) {
   if (maxWidth < 1) return false;
   auto& line = lineScratch_;
   uint16_t lineCount = 0;
@@ -302,6 +310,39 @@ bool CompactTableLayout::wrapCell(const Cell& cell, const uint16_t maxWidth, Tab
   for (uint16_t i = 0; i < cell.tokenCount; ++i) {
     const Token& token = tokens_[cell.firstToken + i];
     const EpdFontFamily::Style style = baseStyle(token.style, baseStyleFallback_);
+    InlineObjectToken object;
+    if (parseInlineObjectToken(std::string_view(buffer_.get() + token.offset, token.length), object)) {
+      const Token* punctuation = nullptr;
+      auto punctuationStyle = EpdFontFamily::REGULAR;
+      uint16_t punctuationWidth = 0;
+      if (object.kind == InlineObjectKind::Math && i + 1 < cell.tokenCount) {
+        const auto& next = tokens_[cell.firstToken + i + 1];
+        const auto* text = reinterpret_cast<const unsigned char*>(buffer_.get() + next.offset);
+        if (next.attachToPrevious && isClosingPunctuationForWrap(utf8NextCodepoint(&text))) {
+          punctuation = &next;
+          punctuationStyle = baseStyle(next.style, baseStyleFallback_);
+          punctuationWidth = measure(next.offset, next.length, punctuationStyle);
+        }
+      }
+      // A drawing is indivisible. A narrow grid cell retries the source row
+      // as full-width paragraphs, where the page can clip an oversized box.
+      const int groupWidth = object.width + punctuationWidth;
+      if (groupWidth > maxWidth && !flatten) return false;
+      const int gap = lineCount > 0 && !token.attachToPrevious ? renderer_.getSpaceWidth(fontId_, style) : 0;
+      if (lineCount > 0 && lineWidth + gap + groupWidth > maxWidth && !flush()) return false;
+      if (!appendLineToken(line, lineCount, lineWidth, maxWidth, token.offset, token.length, style, token.flags,
+                           token.attachToPrevious, emittedAny, cell.style, output)) {
+        return false;
+      }
+      if (punctuation) {
+        if (lineCount >= MAX_ROW_TOKENS) return false;
+        line[lineCount++] = {punctuation->offset, punctuation->length, punctuationWidth,
+                             punctuationStyle,    punctuation->flags,  true};
+        lineWidth = static_cast<uint16_t>(lineWidth + punctuationWidth);
+        ++i;
+      }
+      continue;
+    }
     uint16_t remainingOffset = token.offset;
     uint16_t remainingLength = token.length;
     bool attach = token.attachToPrevious;
@@ -367,10 +408,10 @@ bool CompactTableLayout::wrapCell(const Cell& cell, const uint16_t maxWidth, Tab
   return output.lines.size() <= MAX_LINES_PER_CELL;
 }
 
-bool CompactTableLayout::flattenCell(const Cell& cell, std::vector<std::shared_ptr<TextBlock>>& output) {
+bool CompactTableLayout::flattenCell(const Cell& cell, std::vector<TableCellLine>& output) {
   TableFragmentCell flattened;
   if (!wrapCell(cell, static_cast<uint16_t>(tableWidth() > cellPadding_ * 2 ? tableWidth() - cellPadding_ * 2 : 1),
-                flattened)) {
+                flattened, true)) {
     return false;
   }
   output.insert(output.end(), std::make_move_iterator(flattened.lines.begin()),
@@ -379,7 +420,7 @@ bool CompactTableLayout::flattenCell(const Cell& cell, std::vector<std::shared_p
 }
 
 CompactTableLayout::RowResult CompactTableLayout::finishRowInternal(const bool forceFlatten, TableFragmentRow& gridRow,
-                                                                    std::vector<std::shared_ptr<TextBlock>>& flatLines,
+                                                                    std::vector<TableCellLine>& flatLines,
                                                                     std::vector<FootnoteEntry>& footnotes,
                                                                     uint32_t& visibleTextOffset) {
   if (fatal_ || !rowActive_ || cellActive_) return RowResult::Abort;
@@ -414,7 +455,7 @@ CompactTableLayout::RowResult CompactTableLayout::finishRowInternal(const bool f
     fragmentColumnCount_ = fullWidth ? 1 : columnCount_;
     bool hasHeader = false;
     bool hasData = false;
-    uint16_t rowHeight = lineHeight_ + cellPadding_ * 2;
+    int rowHeight = lineHeight_ + cellPadding_ * 2;
     uint8_t logicalColumn = 0;
     for (uint8_t i = 0; i < cellCount_; ++i) {
       auto& destination = gridRow.cells[i];
@@ -433,8 +474,7 @@ CompactTableLayout::RowResult CompactTableLayout::finishRowInternal(const bool f
         flatLines.clear();
         return finishRowInternal(true, gridRow, flatLines, footnotes, visibleTextOffset);
       }
-      const uint16_t cellHeight =
-          static_cast<uint16_t>(std::max<size_t>(1, destination.lines.size()) * lineHeight_ + cellPadding_ * 2);
+      const int cellHeight = destination.contentHeight(lineHeight_) + cellPadding_ * 2;
       rowHeight = std::max(rowHeight, cellHeight);
       logicalColumn = static_cast<uint8_t>(logicalColumn + destination.colSpan);
     }
@@ -445,7 +485,7 @@ CompactTableLayout::RowResult CompactTableLayout::finishRowInternal(const bool f
       flatLines.clear();
       return finishRowInternal(true, gridRow, flatLines, footnotes, visibleTextOffset);
     }
-    gridRow.height = rowHeight;
+    gridRow.height = static_cast<uint16_t>(rowHeight);
     gridRow.headerSeparator = hasHeader && !hasData;
   }
 
@@ -455,7 +495,7 @@ CompactTableLayout::RowResult CompactTableLayout::finishRowInternal(const bool f
 }
 
 CompactTableLayout::RowResult CompactTableLayout::finishRow(TableFragmentRow& gridRow,
-                                                            std::vector<std::shared_ptr<TextBlock>>& flatLines,
+                                                            std::vector<TableCellLine>& flatLines,
                                                             std::vector<FootnoteEntry>& footnotes,
                                                             uint32_t& visibleTextOffset) {
   flatLines.clear();
