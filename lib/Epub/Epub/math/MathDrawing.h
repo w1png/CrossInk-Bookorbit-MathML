@@ -43,5 +43,7 @@ struct Drawing {
 };
 
 void renderDrawing(const Drawing& drawing, GfxRenderer& renderer, int fontId, int x, int y, bool foregroundBlack);
+// Call under the same render lock as page drawing to release reader scratch.
+void releaseRenderWorkspace();
 
 }  // namespace mathml

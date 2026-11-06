@@ -12,6 +12,11 @@
 namespace mathml {
 namespace {
 
+// EPUB page draws are serialized by RenderLock. The ~3.5 KiB decoder exceeds
+// the render stack budget. Allocate it only when a math glyph needs drawing.
+std::unique_ptr<MathFont> renderFont;
+bool renderFontLoadFailed = false;
+
 int scaleMetric(const int value, const int ppem, const int strikePpem) {
   const int scaled = value * ppem;
   return (scaled + (scaled < 0 ? -strikePpem / 2 : strikePpem / 2)) / strikePpem;
@@ -73,18 +78,45 @@ void drawRule(GfxRenderer& renderer, const DrawCommand& command, const int x, co
 
 }  // namespace
 
+void releaseRenderWorkspace() {
+  renderFont.reset();
+  renderFontLoadFailed = false;
+}
+
 void renderDrawing(const Drawing& drawing, GfxRenderer& renderer, const int fontId, const int x, const int y,
                    const bool foregroundBlack) {
   if (!drawing.commands) return;
 
-  const bool drawsBinary = !renderer.isFontCacheScanning() &&
-                           (renderer.getRenderMode() == GfxRenderer::BW || renderer.grayPlanesAreAbsolute()) &&
-                           renderer.glyphIntersectsStrip(x, y, x + drawing.width - 1, y + drawing.ascent + drawing.descent - 1);
+  const bool scanning = renderer.isFontCacheScanning();
+  // The reader's text prewarm scan starts a new page render. After a failed
+  // allocation wait for the next scan instead of retrying in each strip.
+  if (scanning) renderFontLoadFailed = false;
+  const bool drawsBinary =
+      !scanning && (renderer.getRenderMode() == GfxRenderer::BW || renderer.grayPlanesAreAbsolute()) &&
+      renderer.glyphIntersectsStrip(x, y, x + drawing.width - 1, y + drawing.ascent + drawing.descent - 1);
+  if (!renderFont && (drawsBinary || renderFontLoadFailed) &&
+      std::any_of(drawing.commands.get(), drawing.commands.get() + drawing.commandCount,
+                  [](const DrawCommand& command) { return command.type == DrawType::Glyph; })) {
+    if (!renderFontLoadFailed) {
+      renderFont = makeUniqueNoThrow<MathFont>(bundledMathFontBytes());
+      if (!renderFont || !renderFont->valid()) {
+        LOG_ERR("MTH", "Could not open the math font for rendering (%u bytes)",
+                static_cast<unsigned>(sizeof(MathFont)));
+        renderFont.reset();
+        renderFontLoadFailed = true;
+      }
+    }
+    if (renderFontLoadFailed) {
+      // Show a missing-equation box inside the reserved bounds. Rules or
+      // prose without glyphs could change the meaning of the expression.
+      if (drawsBinary) {
+        const int size = std::min({12, static_cast<int>(drawing.width), drawing.ascent + drawing.descent});
+        if (size > 0) renderer.drawRect(x, y, size, size, foregroundBlack);
+      }
+      return;
+    }
+  }
   const int textFontId = renderer.getFontIdForSize(fontId, drawing.fontSize);
-  // The decoder exceeds the render task's stack budget. One fallible
-  // allocation supplies scratch for every glyph in this drawing.
-  std::unique_ptr<MathFont> mathFont;
-  bool triedFont = false;
   for (uint16_t index = 0; index < drawing.commandCount; ++index) {
     const auto& command = drawing.commands[index];
     if (command.type == DrawType::Text) {
@@ -101,14 +133,7 @@ void renderDrawing(const Drawing& drawing, GfxRenderer& renderer, const int font
 
     switch (command.type) {
       case DrawType::Glyph:
-        if (!triedFont) {
-          triedFont = true;
-          mathFont = makeUniqueNoThrow<MathFont>(bundledMathFontBytes());
-          if (!mathFont || !mathFont->valid()) LOG_ERR("MTH", "Could not open the math font for rendering");
-        }
-        if (mathFont && mathFont->valid()) {
-          drawGlyph(*mathFont, renderer, command, x + command.x, y + command.y, foregroundBlack);
-        }
+        drawGlyph(*renderFont, renderer, command, x + command.x, y + command.y, foregroundBlack);
         break;
       case DrawType::Rule:
         drawRule(renderer, command, x, y, foregroundBlack);

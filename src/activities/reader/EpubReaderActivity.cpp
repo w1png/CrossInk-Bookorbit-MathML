@@ -5,6 +5,7 @@
 #include <Epub/Page.h>
 #include <Epub/PageCountEstimator.h>
 #include <Epub/blocks/TextBlock.h>
+#include <Epub/math/MathDrawing.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -2690,6 +2691,7 @@ void EpubReaderActivity::onExit() {
   ImageBlock::setExtractor(nullptr, nullptr, nullptr);
   releaseGrayscaleStripScratch(true);
   ImageBlock::releaseSessionPixelCache();
+  mathml::releaseRenderWorkspace();
 
   // SD-font caches live in the renderer singleton and can fragment the Home heap.
   // Release every rebuildable cache, including fonts used before the current one.
@@ -8708,6 +8710,7 @@ void EpubReaderActivity::restoreSavedPosition() {
   requestUpdate();
 }
 bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, GfxRenderer& renderer) {
+  mathml::releaseRenderWorkspace();
   auto epub = makeUniqueNoThrow<Epub>(filePath, "/.crosspoint");
   if (!epub) {
     LOG_ERR("SLP", "EPUB: failed to allocate book for sleep-page rendering");
@@ -8875,6 +8878,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
   }
   renderer.clearScreen(ReaderUtils::readerBackgroundColor());
   page->render(renderer, renderFontId, layout.marginLeft, layout.marginTop, ReaderUtils::readerForegroundBlack());
+  mathml::releaseRenderWorkspace();
   drawPublisherPageMarkers(renderer, *page, layout.marginTop, renderer.getScreenHeight() - layout.marginBottom,
                            ReaderUtils::readerForegroundBlack());
   // No displayBuffer call; caller (SleepActivity) handles that after compositing the overlay.
