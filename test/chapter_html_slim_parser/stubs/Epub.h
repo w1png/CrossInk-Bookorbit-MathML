@@ -17,6 +17,7 @@ class Epub {
     return false;
   }
   bool extractItemToFile(const std::string&, const std::string&) const { return false; }
+  bool getItemSize(const std::string&, size_t*) const { return false; }
   bool getOptimizerImageDimensions(const std::string&, uint16_t& width, uint16_t& height) const {
     if (!optimizerImageAvailable) return false;
     width = optimizerImageWidth;

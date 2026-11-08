@@ -49,9 +49,9 @@ class CompactTableLayout final {
   const BlockStyle& tableStyle() const { return tableStyle_; }
 
   // Converts the captured row directly into existing PageTableFragment data.
-  // When the row is unsupported, flatLines receives ordinary TextBlocks so the
+  // When the row is unsupported, flatLines receives the laid-out lines so the
   // parser can explicitly flatten it without reconstructing a ParsedText model.
-  RowResult finishRow(TableFragmentRow& gridRow, std::vector<std::shared_ptr<TextBlock>>& flatLines,
+  RowResult finishRow(TableFragmentRow& gridRow, std::vector<TableCellLine>& flatLines,
                       std::vector<FootnoteEntry>& footnotes, uint32_t& visibleTextOffset);
 
  private:
@@ -102,6 +102,7 @@ class CompactTableLayout final {
   // Reused line scratch; keeping this on the compact layout object avoids a
   // multi-kilobyte stack frame while wrapping a pathological cell.
   std::array<LineToken, MAX_ROW_TOKENS> lineScratch_{};
+  std::unique_ptr<InlineObjectPlacement[]> mathPlacements_;
   uint16_t tokenCount_ = 0;
   std::array<Cell, MAX_CELLS_PER_ROW> cells_{};
   std::array<FootnoteEntry, Page::MAX_FOOTNOTES_PER_PAGE> rowFootnotes_{};
@@ -130,9 +131,8 @@ class CompactTableLayout final {
                        bool attachToPrevious, bool& emittedAny, const BlockStyle& cellStyle, TableFragmentCell& output);
   bool emitLine(std::array<LineToken, MAX_ROW_TOKENS>& line, uint16_t lineCount, uint16_t lineWidth, uint16_t maxWidth,
                 const BlockStyle& style, TableFragmentCell& output);
-  bool wrapCell(const Cell& cell, uint16_t maxWidth, TableFragmentCell& output);
-  bool flattenCell(const Cell& cell, std::vector<std::shared_ptr<TextBlock>>& output);
-  RowResult finishRowInternal(bool forceFlatten, TableFragmentRow& gridRow,
-                              std::vector<std::shared_ptr<TextBlock>>& flatLines, std::vector<FootnoteEntry>& footnotes,
-                              uint32_t& visibleTextOffset);
+  bool wrapCell(const Cell& cell, uint16_t maxWidth, TableFragmentCell& output, bool flatten = false);
+  bool flattenCell(const Cell& cell, std::vector<TableCellLine>& output);
+  RowResult finishRowInternal(bool forceFlatten, TableFragmentRow& gridRow, std::vector<TableCellLine>& flatLines,
+                              std::vector<FootnoteEntry>& footnotes, uint32_t& visibleTextOffset);
 };

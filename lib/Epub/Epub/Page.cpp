@@ -2,7 +2,10 @@
 
 #include <GfxRenderer.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <Serialization.h>
+
+#include <cstdlib>
 
 #include "tables/TableColumnLayout.h"
 #include "tables/TableTextLineOrder.h"
@@ -22,6 +25,45 @@ uint16_t tableSelectionForLine(const size_t elementIndex, const uint8_t logicalC
     return UINT16_MAX;
   }
   return static_cast<uint16_t>(elementIndex * MAX_TABLE_CELLS_PER_ROW + logicalColumn);
+}
+
+bool validMathMetadata(const mathml::Drawing& drawing) {
+  return drawing.width <= mathml::Drawing::MAX_DIMENSION &&
+         static_cast<int>(drawing.ascent) + drawing.descent <= mathml::Drawing::MAX_DIMENSION &&
+         drawing.commandCount <= mathml::Drawing::MAX_COMMANDS && drawing.textBytes <= mathml::Drawing::MAX_TEXT_BYTES;
+}
+
+bool validMathCommands(const mathml::Drawing& drawing) {
+  if ((drawing.commandCount && !drawing.commands) ||
+      (drawing.textBytes && (!drawing.text || drawing.text[drawing.textBytes - 1] != '\0'))) {
+    return false;
+  }
+  constexpr int limit = mathml::Drawing::MAX_DIMENSION;
+  for (uint16_t i = 0; i < drawing.commandCount; ++i) {
+    const auto& command = drawing.commands[i];
+    if (std::abs(static_cast<int>(command.x)) > limit || std::abs(static_cast<int>(command.y)) > limit) return false;
+    switch (command.type) {
+      case mathml::DrawType::Glyph:
+      case mathml::DrawType::Fill:
+        if (command.x2 <= 0 || command.x2 > limit || command.y2 <= 0 || command.y2 > limit) return false;
+        if (command.type == mathml::DrawType::Fill && command.style > 1) return false;
+        break;
+      case mathml::DrawType::Text:
+        if (command.value >= drawing.textBytes || (command.value > 0 && drawing.text[command.value - 1] != '\0')) {
+          return false;
+        }
+        break;
+      case mathml::DrawType::Rule:
+        if (std::abs(static_cast<int>(command.x2)) > limit || std::abs(static_cast<int>(command.y2)) > limit ||
+            command.value == 0 || command.value > limit) {
+          return false;
+        }
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
 }
 
 template <typename Predicate>
@@ -162,6 +204,124 @@ std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize(FsFile& file
   return std::unique_ptr<PageHorizontalRule>(rule);
 }
 
+void PageMath::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                      const bool foregroundBlack) {
+  mathml::renderDrawing(drawing, renderer, fontId, xPos + xOffset, yPos + yOffset, foregroundBlack);
+}
+
+bool PageMath::serialize(FsFile& file) {
+  if (!validMathMetadata(drawing) || !validMathCommands(drawing)) {
+    LOG_ERR("PGE", "Serialization failed: invalid MathML drawing");
+    return false;
+  }
+  const size_t commandBytes = drawing.commandCount * sizeof(mathml::DrawCommand);
+  if (!serialization::tryWritePod(file, xPos) || !serialization::tryWritePod(file, yPos) ||
+      !serialization::tryWritePod(file, drawing.width) || !serialization::tryWritePod(file, drawing.ascent) ||
+      !serialization::tryWritePod(file, drawing.descent) || !serialization::tryWritePod(file, drawing.commandCount) ||
+      !serialization::tryWritePod(file, drawing.textBytes) || !serialization::tryWritePod(file, drawing.fontSize) ||
+      (commandBytes > 0 &&
+       file.write(reinterpret_cast<const uint8_t*>(drawing.commands.get()), commandBytes) != commandBytes) ||
+      (drawing.textBytes > 0 &&
+       file.write(reinterpret_cast<const uint8_t*>(drawing.text.get()), drawing.textBytes) != drawing.textBytes)) {
+    LOG_ERR("PGE", "Serialization failed: could not write MathML drawing");
+    return false;
+  }
+  return true;
+}
+
+std::unique_ptr<PageMath> PageMath::deserialize(FsFile& file) {
+  int16_t x = 0;
+  int16_t y = 0;
+  mathml::Drawing drawing;
+  if (!serialization::tryReadPod(file, x) || !serialization::tryReadPod(file, y) ||
+      !serialization::tryReadPod(file, drawing.width) || !serialization::tryReadPod(file, drawing.ascent) ||
+      !serialization::tryReadPod(file, drawing.descent) || !serialization::tryReadPod(file, drawing.commandCount) ||
+      !serialization::tryReadPod(file, drawing.textBytes) || !serialization::tryReadPod(file, drawing.fontSize) ||
+      !validMathMetadata(drawing)) {
+    LOG_ERR("PGE", "Deserialization failed: invalid MathML drawing metadata");
+    return nullptr;
+  }
+
+  const int commandBytes = drawing.commandCount * sizeof(mathml::DrawCommand);
+  if (file.available() < commandBytes + drawing.textBytes) {
+    LOG_ERR("PGE", "Deserialization failed: truncated MathML drawing");
+    return nullptr;
+  }
+  // The page owns the draw list across renders. Size each allocation to the
+  // cached data (at most 6 KiB of commands and 2 KiB of prose per equation).
+  if (drawing.commandCount > 0) {
+    drawing.commands = makeUniqueNoThrow<mathml::DrawCommand[]>(drawing.commandCount);
+    if (!drawing.commands || file.read(drawing.commands.get(), commandBytes) != commandBytes) {
+      LOG_ERR("PGE", "Deserialization failed: could not read %u MathML commands", drawing.commandCount);
+      return nullptr;
+    }
+  }
+  if (drawing.textBytes > 0) {
+    drawing.text = makeUniqueNoThrow<char[]>(drawing.textBytes);
+    if (!drawing.text || file.read(drawing.text.get(), drawing.textBytes) != drawing.textBytes) {
+      LOG_ERR("PGE", "Deserialization failed: could not read %u MathML prose bytes", drawing.textBytes);
+      return nullptr;
+    }
+  }
+  if (!validMathCommands(drawing)) {
+    LOG_ERR("PGE", "Deserialization failed: invalid MathML drawing commands");
+    return nullptr;
+  }
+
+  auto result = makeUniqueNoThrow<PageMath>(std::move(drawing), x, y);
+  if (!result) LOG_ERR("PGE", "Deserialization failed: could not allocate PageMath");
+  return result;
+}
+
+namespace {
+
+bool serializeTableCellLine(FsFile& file, const TableCellLine& line) {
+  const auto& math = line.math;
+  const uint8_t count = math ? math->count : 0;
+  if (!line.text || !line.text->serialize(file) || !serialization::tryWritePod(file, count)) return false;
+  if (count == 0) return true;
+  if (!serialization::tryWritePod(file, static_cast<uint16_t>(math->metrics.height)) ||
+      !serialization::tryWritePod(file, static_cast<uint16_t>(math->metrics.textTop)) ||
+      !serialization::tryWritePod(file, static_cast<uint16_t>(math->metrics.baseline))) {
+    return false;
+  }
+  for (uint8_t i = 0; i < count; ++i) {
+    const auto& drawing = math->placements[i].drawing;
+    if (!drawing || !drawing->serialize(file)) return false;
+  }
+  return true;
+}
+
+bool deserializeTableCellLineMath(FsFile& file, TableCellLine& line) {
+  uint8_t count = 0;
+  if (!serialization::tryReadPod(file, count) || count > TableCellMath::MAX_OBJECTS) return false;
+  if (count == 0) return true;
+
+  uint16_t height = 0;
+  uint16_t textTop = 0;
+  uint16_t baseline = 0;
+  if (!serialization::tryReadPod(file, height) || !serialization::tryReadPod(file, textTop) ||
+      !serialization::tryReadPod(file, baseline) || height == 0 || textTop > baseline || baseline > height) {
+    return false;
+  }
+  auto sidecar = makeUniqueNoThrow<TableCellMath>();
+  if (!sidecar || !(sidecar->placements = makeUniqueNoThrow<TableCellMathPlacement[]>(count))) return false;
+  sidecar->count = count;
+  sidecar->metrics = {height, textTop, baseline};
+  for (uint8_t i = 0; i < count; ++i) {
+    auto drawing = PageMath::deserialize(file);
+    if (!drawing || drawing->yPos < 0 || drawing->yPos + drawing->getDrawing().ascent != baseline ||
+        baseline + drawing->getDrawing().descent > height) {
+      return false;
+    }
+    sidecar->placements[i].drawing = std::move(drawing);
+  }
+  line.math = std::move(sidecar);
+  return true;
+}
+
+}  // namespace
+
 bool TableFragmentCell::serialize(FsFile& file) const {
   if (colSpan == 0 || colSpan > MAX_TABLE_CELLS_PER_ROW || lines.size() > MAX_TABLE_LINES_PER_CELL) {
     LOG_ERR("PTB", "Serialization failed: invalid cell span/line count (span=%u lines=%u)", colSpan,
@@ -175,7 +335,7 @@ bool TableFragmentCell::serialize(FsFile& file) const {
     return false;
   }
   for (const auto& line : lines) {
-    if (!line || !line->serialize(file)) {
+    if (!serializeTableCellLine(file, line)) {
       LOG_ERR("PTB", "Serialization failed: invalid table cell line");
       return false;
     }
@@ -199,12 +359,16 @@ bool TableFragmentCell::deserialize(FsFile& file, TableFragmentCell& outCell) {
   outCell.lines.clear();
   outCell.lines.reserve(lineCount);
   for (uint8_t i = 0; i < lineCount; i++) {
-    auto line = TextBlock::deserialize(file);
-    if (!line) {
+    auto text = TextBlock::deserialize(file);
+    if (!text) {
       LOG_ERR("PTB", "Deserialization failed: invalid table cell line");
       return false;
     }
-    outCell.lines.push_back(std::move(line));
+    auto& line = outCell.lines.emplace_back(std::move(text));
+    if (!deserializeTableCellLineMath(file, line)) {
+      LOG_ERR("PTB", "Deserialization failed: invalid table cell MathML");
+      return false;
+    }
   }
   return true;
 }
@@ -311,9 +475,16 @@ void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const in
       const int cellTextHeight = row.height - cellPadding * 2;
 
       renderer.beginTextClip(cellTextX, cellTextY, cellTextWidth, cellTextHeight);
-      for (size_t lineIndex = 0; lineIndex < cell.lines.size(); lineIndex++) {
-        cell.lines[lineIndex]->render(renderer, fontId, cellTextX, cellTextY + static_cast<int>(lineIndex) * lineHeight,
-                                      foregroundBlack);
+      int lineY = cellTextY;
+      for (const auto& line : cell.lines) {
+        line.text->render(renderer, fontId, cellTextX, lineY + line.textTop(), foregroundBlack);
+        if (line.math) {
+          for (uint8_t i = 0; i < line.math->count; ++i) {
+            const auto& drawing = line.math->placements[i].drawing;
+            if (drawing) drawing->render(renderer, fontId, cellTextX, lineY, foregroundBlack);
+          }
+        }
+        lineY += line.height(lineHeight);
       }
       renderer.endTextClip();
       logicalColumn = static_cast<uint8_t>(logicalColumn + span);
@@ -366,8 +537,8 @@ bool Page::forEachTextLine(const PageTextLineVisitor visitor, void* context) con
 
     int currentY = 0;
     for (const auto& row : fragment.rows) {
-      const bool visited =
-          TableTextLineOrder::forEachCellLineInVisualOrder(row, [&](const size_t cellIndex, const size_t lineIndex) {
+      const bool visited = TableTextLineOrder::forEachPositionedCellLineInVisualOrder<MAX_TABLE_CELLS_PER_ROW>(
+          row, fragment.lineHeight, [&](const size_t cellIndex, const size_t lineIndex, const int textY) {
             uint8_t logicalColumn = 0;
             for (size_t precedingCell = 0; precedingCell < cellIndex; ++precedingCell) {
               if (logicalColumn >= fragment.columnCount) return true;
@@ -379,7 +550,8 @@ bool Page::forEachTextLine(const PageTextLineVisitor visitor, void* context) con
             if (logicalColumn >= fragment.columnCount) return true;
 
             const auto& cell = row.cells[cellIndex];
-            if (!cell.lines[lineIndex]) return true;
+            const auto& text = cell.lines[lineIndex].text;
+            if (!text || text->wordCount() == 0) return true;
             const uint8_t span = std::min<uint8_t>(cell.colSpan == 0 ? 1 : cell.colSpan,
                                                    static_cast<uint8_t>(fragment.columnCount - logicalColumn));
             const int cellX = fragment.xPos +
@@ -389,17 +561,9 @@ bool Page::forEachTextLine(const PageTextLineVisitor visitor, void* context) con
             const int cellWidth = TableColumnLayout::innerWidth(fragment.width, fragment.columnCount, logicalColumn,
                                                                 span, fragment.cellPadding);
             const int cellHeight = std::max(0, static_cast<int>(row.height) - fragment.cellPadding * 2);
-            const int lineY = cellY + static_cast<int>(lineIndex) * fragment.lineHeight;
-            const PageTextLine line{cell.lines[lineIndex].get(),
-                                    cellX,
-                                    lineY,
-                                    cellX,
-                                    cellY,
-                                    cellWidth,
-                                    cellHeight,
-                                    fragment.lineHeight,
-                                    true,
-                                    tableSelectionForLine(elementIndex, logicalColumn)};
+            const PageTextLine line{
+                text.get(), cellX,      cellY + textY,       cellX, cellY,
+                cellWidth,  cellHeight, fragment.lineHeight, true,  tableSelectionForLine(elementIndex, logicalColumn)};
             return visitor(line, context);
           });
       if (!visited) return false;
@@ -538,6 +702,7 @@ uint16_t Page::imageEstimateUnits(const uint16_t viewportWidth, const uint16_t v
       }
       case TAG_PageLine:
       case TAG_PageTableFragment:
+      case TAG_PageMath:
         hasReadableContent = true;
         break;
       case TAG_PageHorizontalRule:
@@ -659,6 +824,12 @@ std::unique_ptr<Page> Page::deserialize(FsFile& file) {
         return nullptr;
       }
       page->elements.push_back(std::move(rule));
+    } else if (tag == TAG_PageMath) {
+      auto math = PageMath::deserialize(file);
+      if (!math) {
+        return nullptr;
+      }
+      page->elements.push_back(std::move(math));
     } else {
       LOG_ERR("PGE", "Deserialization failed: Unknown tag %u", tag);
       return nullptr;

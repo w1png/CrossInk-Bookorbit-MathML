@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "InlineObjectToken.h"
 #include "blocks/BlockStyle.h"
 #include "blocks/TextBlock.h"
 
@@ -18,14 +19,6 @@ template <typename T>
 class ArenaVector;
 
 class ParsedText {
- public:
-  struct InlineImagePlacement {
-    uint16_t id;
-    int16_t x;
-    uint16_t height;
-  };
-
- private:
   // words/rubyTexts are std::deque, not std::vector: a paragraph can hold thousands
   // of tokens (CJK splits every character), and a vector grows by reallocating its
   // whole element array into one contiguous block (32 B/std::string -> 64-128 KB at
@@ -75,6 +68,7 @@ class ParsedText {
   // buffered. The next layout pass must not apply first-line paragraph rules.
   bool isContinuation_ = false;
   bool allowCharacterBreaks_ = false;
+  bool hasInlineObjects_ = false;
   std::vector<std::string> reorderedWordsScratch;
   std::vector<EpdFontFamily::Style> reorderedStylesScratch;
   std::vector<bool> reorderedContinuesScratch;
@@ -92,9 +86,11 @@ class ParsedText {
   std::vector<uint8_t> lineBackgroundBlackScratch;
   std::vector<int16_t> lineLeadingPaddingScratch;
   std::vector<uint16_t> visualOrderScratch;
-  std::vector<InlineImagePlacement> lineImagesScratch;
+  std::vector<InlineObjectPlacement> lineObjectsScratch;
 
   void reserveTokenCapacity(size_t additionalTokens);
+  void addInlineObject(std::string token, bool attachToPrevious, uint32_t visibleTextOffset,
+                       uint32_t referenceTextOffset);
   int resolveFirstLineIndent(bool isFirstLine, const GfxRenderer& renderer, int fontId) const;
   bool calculateGapMetrics(ArenaVector<int16_t>& naturalGaps, ArenaVector<uint8_t>& gapSlots,
                            const GfxRenderer& renderer, int fontId);
@@ -149,9 +145,12 @@ class ParsedText {
                uint32_t referenceTextOffset = 0, int16_t leadingPadding = 0);
   void addInlineImage(uint16_t id, uint16_t width, uint16_t height, bool attachToPrevious, uint32_t visibleTextOffset,
                       uint32_t referenceTextOffset);
-  const std::vector<InlineImagePlacement>& currentLineImages() const { return lineImagesScratch; }
+  bool addInlineMath(uint16_t id, uint16_t width, uint16_t ascent, uint16_t descent, bool attachToPrevious,
+                     uint32_t visibleTextOffset, uint32_t referenceTextOffset);
+  const std::vector<InlineObjectPlacement>& currentLineObjects() const { return lineObjectsScratch; }
   void setRubyForWordAt(size_t index, const std::string& ruby);
   void setRubyGroupAt(size_t startIndex, size_t count, const std::string& ruby);
+  const char* getWordAt(const size_t index) const { return index < words.size() ? words[index].c_str() : ""; }
   EpdFontFamily::Style getWordStyleAt(size_t index) const {
     return index < wordStyles.size() ? wordStyles[index] : EpdFontFamily::REGULAR;
   }
@@ -166,7 +165,8 @@ class ParsedText {
   bool layoutAndExtractLines(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
                              const std::function<void(std::shared_ptr<TextBlock>, uint32_t, uint32_t)>& processLine,
                              bool includeLastLine = true);
-  bool layoutAndExtractLinesPreservingSource(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
-                                             const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
-                                             bool allowCharacterBreaks = false) const;
+  bool layoutAndExtractLinesPreservingSource(
+      const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
+      const std::function<void(std::shared_ptr<TextBlock>, const std::vector<InlineObjectPlacement>&)>& processLine,
+      bool allowCharacterBreaks = false) const;
 };

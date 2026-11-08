@@ -5,6 +5,8 @@ records only its own additions. Each release states the CrossInk version it is b
 on; for everything inherited from upstream, see the
 [CrossInk changelog](https://github.com/uxjulia/CrossInk/blob/main/CHANGELOG.md).
 
+## Unreleased
+=======
 ## [v1.6.1+bookorbit.6] - 2026-11-07
 
 Based on CrossInk v1.6.1.
@@ -20,6 +22,8 @@ Based on CrossInk v1.6.1.
 
 ### Added
 
+- EPUBs can display inline and standalone MathML equations using a bundled math font.
+=======
 - A BookOrbit catalog book list can be sorted and filtered by reading status. Sort offers the Library's orders that BookOrbit supports (date added, title, author by last name, recently read, series), with A-Z or Z-A first in the list as in the Library; Filter shows all books, or only unread, reading or finished ones. On the X3 and X4, Left sorts and Right filters while Up and Down move through the list, as in the Library; on touch devices, two buttons in the header do the same. The server sorts and filters, so a long list still pages exactly, and the header shows the filter and how many books match. The choice applies to the list you are in, and comes back after a download on the X3 and X4.
 - BookOrbit catalog book lists are split into sections, as the Library is when its List View is Expanded: by first letter when sorted by title or author, by day when sorted by date added, and by series when sorted by series. The sort picker can switch the List View between Expanded and Compact, the same setting the Library uses.
 - The BookOrbit catalog lists your Want to Read shelf, the books you most recently marked as want to read in BookOrbit, as its KOReader plugin shows them. It appears when your server offers that shelf, which holds a dozen books at most.

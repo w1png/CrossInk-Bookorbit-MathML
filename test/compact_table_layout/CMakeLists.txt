@@ -1,6 +1,7 @@
 add_executable(CompactTableLayoutTest
   CompactTableLayoutTest.cpp
   ${REPO_ROOT}/lib/Epub/Epub/tables/CompactTableLayout.cpp
+  ${REPO_ROOT}/lib/Epub/Epub/tables/TableCellLine.cpp
 )
 
 target_include_directories(CompactTableLayoutTest PRIVATE

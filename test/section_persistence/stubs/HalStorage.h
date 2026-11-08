@@ -31,7 +31,7 @@ class HalFile : public Print {
   void flush() {}
   size_t size() const { return data_ ? data_->bytes.size() : 0; }
   size_t fileSize() const { return size(); }
-  int available() const { return data_ && cursor_ < data_->bytes.size(); }
+  int available() const { return data_ ? static_cast<int>(data_->bytes.size() - std::min(cursor_, size())) : 0; }
   size_t position() const { return cursor_; }
 
   int read(void* output, const size_t length) {

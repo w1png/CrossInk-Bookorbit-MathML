@@ -70,17 +70,21 @@ TEST(CompactTableLayoutTest, WideLeadingColumnKeepsEightColumnTableLabelsReadabl
 }
 
 TEST(CompactTableLayoutTest, VisitsWrappedCellsInVisualReadingOrder) {
+  struct Line {
+    int height(int defaultHeight) const { return defaultHeight; }
+    int textTop() const { return 0; }
+  };
   struct Cell {
-    std::vector<int> lines;
+    std::vector<Line> lines;
   };
   struct Row {
     std::vector<Cell> cells;
   };
 
-  const Row row{{{{1, 2}}, {{3}}, {{4, 5}}}};
+  const Row row{{{{{}, {}}}, {{{}}}, {{{}, {}}}}};
   std::vector<std::pair<size_t, size_t>> visited;
-  ASSERT_TRUE(
-      TableTextLineOrder::forEachCellLineInVisualOrder(row, [&](const size_t cellIndex, const size_t lineIndex) {
+  ASSERT_TRUE(TableTextLineOrder::forEachPositionedCellLineInVisualOrder<3>(
+      row, 10, [&](const size_t cellIndex, const size_t lineIndex, int) {
         visited.emplace_back(cellIndex, lineIndex);
         return true;
       }));
@@ -102,7 +106,7 @@ TEST(CompactTableLayoutTest, CompactLayoutUsesWideLeadingColumnForEightCellRows)
   }
 
   TableFragmentRow row;
-  std::vector<std::shared_ptr<TextBlock>> flatLines;
+  std::vector<TableCellLine> flatLines;
   std::vector<FootnoteEntry> footnotes;
   uint32_t offset = 0;
   ASSERT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Ok);
@@ -120,7 +124,7 @@ TEST(CompactTableLayoutTest, PreservesColspanAndFullWidthRows) {
   ASSERT_TRUE(layout.appendWord("Group", EpdFontFamily::BOLD, false, false, 0));
   ASSERT_TRUE(layout.endCell({}));
   TableFragmentRow row;
-  std::vector<std::shared_ptr<TextBlock>> flatLines;
+  std::vector<TableCellLine> flatLines;
   std::vector<FootnoteEntry> footnotes;
   uint32_t offset = 0;
   const auto result = layout.finishRow(row, flatLines, footnotes, offset);
@@ -141,7 +145,7 @@ TEST(CompactTableLayoutTest, BreaksUtf8AndOversizedCodepointsWithoutAbort) {
   ASSERT_TRUE(layout.appendWord(longUtf8, EpdFontFamily::REGULAR, false, false, 0));
   ASSERT_TRUE(layout.endCell({}));
   TableFragmentRow row;
-  std::vector<std::shared_ptr<TextBlock>> flatLines;
+  std::vector<TableCellLine> flatLines;
   std::vector<FootnoteEntry> footnotes;
   uint32_t offset = 0;
   EXPECT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Ok);
@@ -160,7 +164,7 @@ TEST(CompactTableLayoutTest, BreaksUtf8AndOversizedCodepointsWithoutAbort) {
   EXPECT_NE(oversizedResult, CompactTableLayout::RowResult::Abort);
   ASSERT_EQ(row.cells.size(), 1u);
   ASSERT_EQ(row.cells.front().lines.size(), 1u);
-  EXPECT_EQ(row.cells.front().lines.front()->words.size(), 1u);
+  EXPECT_EQ(row.cells.front().lines.front().text->words.size(), 1u);
 }
 
 TEST(CompactTableLayoutTest, UnsupportedRowsFlattenDeterministically) {
@@ -172,11 +176,84 @@ TEST(CompactTableLayoutTest, UnsupportedRowsFlattenDeterministically) {
   ASSERT_TRUE(layout.endCell({}));
   layout.markUnsupported();
   TableFragmentRow row;
-  std::vector<std::shared_ptr<TextBlock>> flatLines;
+  std::vector<TableCellLine> flatLines;
   std::vector<FootnoteEntry> footnotes;
   uint32_t offset = 0;
   EXPECT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Flatten);
   EXPECT_FALSE(flatLines.empty());
+}
+
+TEST(CompactTableLayoutTest, MeasuresInlineMathWithoutExposingItsTokenAsText) {
+  GfxRenderer renderer;
+  CompactTableLayout layout(renderer, 0, 80, 200, 10, 2, leftStyle());
+  ASSERT_TRUE(layout.beginRow());
+  ASSERT_TRUE(layout.beginCell(false, 1, 0, leftStyle()));
+  ASSERT_TRUE(layout.appendWord("a", EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.appendWord(makeInlineMathToken(7, 20, 18, 12), EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.appendWord("b", EpdFontFamily::REGULAR, true, false, 0));
+  ASSERT_TRUE(layout.endCell({}));
+
+  TableFragmentRow row;
+  std::vector<TableCellLine> flatLines;
+  std::vector<FootnoteEntry> footnotes;
+  uint32_t offset = 0;
+  ASSERT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Ok);
+  ASSERT_EQ(row.cells.front().lines.size(), 1u);
+  const auto& line = row.cells.front().lines.front();
+  ASSERT_TRUE(line.math);
+  ASSERT_EQ(line.math->count, 1);
+  EXPECT_EQ(line.math->placements[0].placement.id, 7);
+  EXPECT_EQ(line.math->placements[0].placement.x, 2);
+  EXPECT_EQ(line.text->words, (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(line.text->xPositions, (std::vector<int16_t>{0, 22}));
+  EXPECT_EQ(line.textTop(), 5);
+  EXPECT_EQ(row.height, 22);
+}
+
+TEST(CompactTableLayoutTest, WideEquationFlattensWithoutSplittingTheDrawing) {
+  GfxRenderer renderer;
+  CompactTableLayout layout(renderer, 0, 80, 200, 10, 2, leftStyle());
+  ASSERT_TRUE(layout.beginRow());
+  ASSERT_TRUE(layout.beginCell(false, 1, 0, leftStyle()));
+  ASSERT_TRUE(layout.appendWord(makeInlineMathToken(1, 60, 18, 12), EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.endCell({}));
+  ASSERT_TRUE(layout.beginCell(false, 1, 0, leftStyle()));
+  ASSERT_TRUE(layout.appendWord("b", EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.endCell({}));
+
+  TableFragmentRow row;
+  std::vector<TableCellLine> flatLines;
+  std::vector<FootnoteEntry> footnotes;
+  uint32_t offset = 0;
+  ASSERT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Flatten);
+  ASSERT_EQ(flatLines.size(), 2u);
+  ASSERT_TRUE(flatLines.front().math);
+  EXPECT_EQ(flatLines.front().math->count, 1);
+  EXPECT_TRUE(flatLines.front().text->words.empty());
+  EXPECT_EQ(flatLines.back().text->words, (std::vector<std::string>{"b"}));
+}
+
+TEST(CompactTableLayoutTest, TrailingPunctuationWrapsWithItsEquation) {
+  GfxRenderer renderer;
+  CompactTableLayout layout(renderer, 0, 32, 200, 10, 2, leftStyle());
+  ASSERT_TRUE(layout.beginRow());
+  ASSERT_TRUE(layout.beginCell(false, 1, 0, leftStyle()));
+  ASSERT_TRUE(layout.appendWord("1234567", EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.appendWord(makeInlineMathToken(1, 20, 18, 12), EpdFontFamily::REGULAR, false, false, 0));
+  ASSERT_TRUE(layout.appendWord(",", EpdFontFamily::REGULAR, true, false, 0));
+  ASSERT_TRUE(layout.endCell({}));
+
+  TableFragmentRow row;
+  std::vector<TableCellLine> flatLines;
+  std::vector<FootnoteEntry> footnotes;
+  uint32_t offset = 0;
+  ASSERT_EQ(layout.finishRow(row, flatLines, footnotes, offset), CompactTableLayout::RowResult::Ok);
+  const auto& lines = row.cells.front().lines;
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_FALSE(lines.front().math);
+  ASSERT_TRUE(lines.back().math);
+  EXPECT_EQ(lines.back().text->words, (std::vector<std::string>{","}));
+  EXPECT_EQ(lines.back().text->xPositions, (std::vector<int16_t>{20}));
 }
 
 }  // namespace

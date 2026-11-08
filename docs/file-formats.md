@@ -866,6 +866,12 @@ Then `ERA_HISTORY` (6) correction records of 24 bytes each:
 
 ## `section.bin`
 
+### Version 84
+
+Pages can store positioned MathML drawings. Table cell lines can also store
+drawings and their shared baseline. Complete files use byte `84` and suspended
+partials use `0xC5`. Older complete and partial sections rebuild automatically.
+
 ### Version 83
 
 Nested paragraphs and other blocks retain inherited CSS bold and italic styles,
@@ -1078,7 +1084,8 @@ enum PageElementTag : u8 {
     TAG_PageLine = 1,
     TAG_PageImage = 2,
     TAG_PageTableFragment = 3,
-    TAG_PageHorizontalRule = 4
+    TAG_PageHorizontalRule = 4,
+    TAG_PageMath = 5
 };
 
 enum WordStyle : u8 {
@@ -1174,10 +1181,45 @@ struct PageHorizontalRule {
     u8 thickness;
 };
 
+struct MathDrawCommand {
+    s16 x;
+    s16 y;
+    s16 x2;
+    s16 y2;
+    u16 value;
+    u8 type; // Glyph, text, rule, or fill, in that order.
+    u8 style;
+};
+
+struct PageMath {
+    s16 xPos;
+    s16 yPos;
+    u16 width;
+    u16 ascent;
+    u16 descent;
+    u16 commandCount;
+    u16 textBytes;
+    u8 fontSize;
+    MathDrawCommand commands[commandCount];
+    u8 text[textBytes]; // NUL-terminated UTF-8 runs referenced by byte offset.
+};
+
+struct TableCellLine {
+    TextBlock text;
+    u8 mathCount;
+    if (mathCount != 0) {
+        u16 height;
+        u16 textTop;
+        u16 baseline;
+        PageMath drawings[mathCount];
+    }
+};
+
 struct TableFragmentCell {
     bool isHeader;
+    u8 colSpan;
     u8 lineCount;
-    TextBlock lines[lineCount];
+    TableCellLine lines[lineCount];
 };
 
 struct TableFragmentRow {
@@ -1208,6 +1250,8 @@ struct PageElement {
         PageTableFragment tableFragment [[inline]];
     } else if (pageElementType == TAG_PageHorizontalRule) {
         PageHorizontalRule horizontalRule [[inline]];
+    } else if (pageElementType == TAG_PageMath) {
+        PageMath math [[inline]];
     } else {
         std::error(std::format("Unknown page element type: {}", pageElementType));
     }

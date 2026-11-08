@@ -1052,6 +1052,207 @@ void ChapterHtmlSlimParser::emitHorizontalRule(const BlockStyle& blockStyle) {
   }
 }
 
+void ChapterHtmlSlimParser::startMath(const XML_Char** atts, const CssStyle& cssStyle) {
+  mathDepth = 1;
+  mathAnnotationDepth = 0;
+  const char* display = getAttribute(atts, "display");
+  const char* mode = getAttribute(atts, "mode");
+  mathDisplay = cssStyle.hasDisplay()
+                    ? cssStyle.display == CssDisplay::Block
+                    : (display ? strcmp(display, "block") == 0 : mode && strcmp(mode, "display") == 0);
+  mathVisibleOffset = visibleTextOffset;
+  mathReferenceOffset = referenceTextOffset;
+  // A formula capture spans callbacks and is too large for the parser task stack.
+  // Leave room for the math font's block decoder and the existing page builder.
+  const auto heap = MemoryBudget::snapshot();
+  if (!mathCapture && heap.freeHeap >= MemoryBudget::EPUB_TEXT_LAYOUT_MIN_FREE + 12 * 1024) {
+    mathCapture = makeUniqueNoThrow<mathml::Capture>();
+  }
+  if (!mathCapture) {
+    LOG_ERR("MML", "No heap for formula capture");
+    return;
+  }
+  mathCapture->reset();
+  mathCapture->start("math", atts);
+}
+
+void ChapterHtmlSlimParser::finishMath() {
+  const auto& style = currentTextBlock ? currentTextBlock->getBlockStyle() : blockStyleBuf_[blockStyleCount_ - 1];
+  int width = std::max(1, static_cast<int>(viewportWidth) - style.totalHorizontalInset());
+  const bool inList = pendingListMarkerDepth >= 0 && pendingListMarkerDepth == depth - 1;
+  if (inList && currentTextBlock && currentTextBlock->size() == 1) {
+    const auto markerFont = currentTextFontId();
+    const auto markerWidth =
+        renderer.getTextAdvanceX(markerFont, currentTextBlock->getWordAt(0), EpdFontFamily::REGULAR);
+    width = std::max(1, width - markerWidth - renderer.getSpaceWidth(markerFont, EpdFontFamily::REGULAR));
+  }
+  if ((currentCompactTable && currentCompactTable->hasActiveCell()) || currentTableBuffer) {
+    const int knownColumns =
+        currentCompactTable ? currentCompactTable->fragmentColumnCount() : currentTableBuffer->maxCols;
+    width = std::max(1, width / std::max(2, knownColumns) - 2 * TABLE_CELL_PADDING);
+  }
+  mathml::Drawing drawing;
+  const int maxHeight =
+      mathDisplay && tableDepth == 0 && !inList ? viewportHeight : std::max(1, viewportHeight - effectiveLineHeight());
+  if (mathCapture && mathCapture->valid() &&
+      mathml::layout(mathCapture->nodes(), renderer, currentTextFontId(), width, maxHeight, style.fontSize, mathDisplay,
+                     drawing) &&
+      placeMath(std::move(drawing), mathDisplay)) {
+    return;
+  }
+  LOG_DBG("MML", "Using fallback for formula at source offset %u", mathVisibleOffset);
+  emitMathFallback(mathCapture.get());
+}
+
+bool ChapterHtmlSlimParser::placeMath(mathml::Drawing drawing, const bool display) {
+  if (!currentTextBlock && !currentCompactTable) return false;
+  const bool attachToPrevious = partWordBufferIndex != 0 || nextWordContinues;
+  if (partWordBufferIndex != 0) flushPartWordBuffer();
+  if (lowMemoryAbort || previewStopRequested) return true;
+
+  const bool afterListMarker = pendingListMarkerDepth >= 0 && pendingListMarkerDepth == depth - 1 && currentTextBlock &&
+                               currentTextBlock->size() == 1;
+  const int height = drawing.ascent + drawing.descent;
+  const auto width = drawing.width;
+  const auto ascent = drawing.ascent;
+  const auto descent = drawing.descent;
+  auto element = makeUniqueNoThrow<PageMath>(std::move(drawing), 0, 0);
+  if (!element) {
+    LOG_ERR("MML", "No heap for formula drawing");
+    return false;
+  }
+
+  if (!display || afterListMarker || tableDepth != 0) {
+    // A bounded set of formulas can wait for the paragraph line breaker.
+    if (!pendingMath) pendingMath = makeUniqueNoThrow<PendingMath>();
+    if (!pendingMath) {
+      LOG_ERR("MML", "No heap for inline formula slots");
+      return false;
+    }
+    const auto availableSlot = [this] {
+      return std::find_if(pendingMath->begin(), pendingMath->end(), [](const auto& item) { return !item; });
+    };
+    auto slot = availableSlot();
+    if (slot == pendingMath->end() && tableDepth == 0) {
+      flushLongTextRunIfNeeded(true);
+      if (lowMemoryAbort || previewStopRequested) return true;
+      slot = availableSlot();
+    }
+    if (slot == pendingMath->end()) {
+      LOG_ERR("MML", "Inline formula slots exhausted");
+      return false;
+    }
+    const auto id = static_cast<uint16_t>(slot - pendingMath->begin());
+    const bool inserted =
+        currentCompactTable && currentCompactTable->hasActiveCell()
+            ? currentCompactTable->appendWord(makeInlineMathToken(id, width, height, ascent), EpdFontFamily::REGULAR,
+                                              attachToPrevious, false, 0)
+            : currentTextBlock &&
+                  currentTextBlock->addInlineMath(id, width, ascent, descent, attachToPrevious && !afterListMarker,
+                                                  mathVisibleOffset, mathReferenceOffset);
+    if (!inserted) return false;
+    *slot = std::move(element);
+    nextWordContinues = true;
+    flushLongTextRunIfNeeded();
+    return true;
+  }
+
+  const auto style = currentTextBlock->getBlockStyle();
+  const bool afterText = !currentTextBlock->isEmpty();
+  if (afterText) {
+    startNewTextBlock(style.withoutTop().withoutBottom());
+  } else {
+    flushPendingAnchor();
+  }
+  if (lowMemoryAbort || previewStopRequested) return true;
+  const int top = afterText ? 0 : std::clamp<int>(style.topInset(), 0, std::max(0, viewportHeight - height));
+  if (currentPage && !currentPage->elements.empty() && currentPageNextY + top + height > viewportHeight) {
+    completeCurrentPage();
+    ++completedPageCount;
+    stopPreviewIfPageLimitReached();
+  }
+  if (previewStopRequested || (!currentPage && !startNewPage("display formula"))) return true;
+  currentPageNextY = std::min<int>(currentPageNextY, std::max(0, viewportHeight - top - height));
+
+  const int innerWidth = viewportWidth - style.totalHorizontalInset();
+  element->xPos = style.leftInset() + std::max(0, (innerWidth - width) / 2);
+  element->yPos = currentPageNextY + top;
+  setCurrentPageVisibleOffset(mathVisibleOffset, mathReferenceOffset);
+  markCurrentPageFromCurrentElement();
+  attachPendingPublisherPageMarkers(element->yPos);
+  currentPage->elements.push_back(std::move(element));
+  currentPageNextY += top + height;
+  currentTextBlock->setBlockStyle(style.withoutTop().withoutBottom());
+  nextWordContinues = false;
+  headingOpenerActive = false;
+  return true;
+}
+
+void ChapterHtmlSlimParser::emitMathFallback(const mathml::Capture* capture) {
+  const char* alt = capture ? capture->rootAttribute("alttext") : nullptr;
+  if (!alt || !*alt) alt = tr(STR_EPUB_MATH_UNAVAILABLE);
+  const char* image = capture ? capture->rootAttribute("altimg") : nullptr;
+  if (image && *image && imageRendering == 0 && tableDepth == 0 && image[0] != '/' && !std::strchr(image, ':')) {
+    const auto resolved = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(contentBase + image));
+    size_t bytes = 0;
+    if (ImageDecoderFactory::isFormatSupported(resolved) && epub->getItemSize(resolved, &bytes) && bytes != 0) {
+      const char* attributes[] = {"src",  image, "alt", alt, "style", mathDisplay ? "display:block" : "display:inline",
+                                  nullptr};
+      startElement(this, "img", attributes);
+      endElement(this, "img");
+      return;
+    }
+  }
+  const auto savedVisible = visibleTextOffset;
+  const auto savedReference = referenceTextOffset;
+  const bool savedSynthetic = syntheticCharacterData;
+  const bool inList = pendingListMarkerDepth >= 0 && pendingListMarkerDepth == depth - 1;
+  const bool separateBlock = mathDisplay && tableDepth == 0 && currentTextBlock && !inList;
+  if (separateBlock) {
+    if (partWordBufferIndex != 0) flushPartWordBuffer();
+    if (!currentTextBlock->isEmpty()) startNewTextBlock(currentTextBlock->getBlockStyle().withoutTop());
+  }
+  visibleTextOffset = mathVisibleOffset;
+  referenceTextOffset = mathReferenceOffset;
+  syntheticCharacterData = true;
+  characterData(this, alt, static_cast<int>(strlen(alt)));
+  syntheticCharacterData = savedSynthetic;
+  visibleTextOffset = savedVisible;
+  referenceTextOffset = savedReference;
+  if (separateBlock && currentTextBlock && !previewStopRequested && !lowMemoryAbort) {
+    if (partWordBufferIndex != 0) flushPartWordBuffer();
+    startNewTextBlock(currentTextBlock->getBlockStyle().withoutTop().withoutBottom());
+  }
+}
+
+bool ChapterHtmlSlimParser::bindTableMath(TableCellLine& line) {
+  if (!line.math) return true;
+  for (size_t i = 0; i < line.math->count; ++i) {
+    auto& placed = line.math->placements[i];
+    const auto& object = placed.placement;
+    if (!pendingMath || object.id >= pendingMath->size() || !(*pendingMath)[object.id]) {
+      LOG_ERR("MML", "Missing table formula %u", object.id);
+      lowMemoryAbort = true;
+      return false;
+    }
+    placed.drawing = std::move((*pendingMath)[object.id]);
+    placed.drawing->xPos = object.x;
+    placed.drawing->yPos = line.math->metrics.baseline - object.ascent;
+  }
+  return true;
+}
+
+bool ChapterHtmlSlimParser::bindTableMath(const std::span<TableFragmentRow> rows) {
+  for (auto& row : rows) {
+    for (auto& cell : row.cells) {
+      for (auto& line : cell.lines) {
+        if (!bindTableMath(line)) return false;
+      }
+    }
+  }
+  return true;
+}
+
 void ChapterHtmlSlimParser::emitBufferedTableAsParagraphs(BufferedTable& table) {
   if (!currentPage) {
     if (!startNewPage("table paragraph fallback")) {
@@ -1119,6 +1320,7 @@ bool ChapterHtmlSlimParser::flushStreamingTableFragment(BufferedTable& table) {
       (horizontalInset < viewportWidth) ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
   const uint16_t lineHeight = renderer.getLineHeight(fontId) * lineCompression;
   const uint16_t fragmentHeight = table.streamingFragmentHeight;
+  if (!bindTableMath(table.streamingFragmentRows)) return false;
   auto fragment = makeUniqueNoThrow<PageTableFragment>(
       tableWidth, table.streamingFragmentColumnCount, TABLE_CELL_PADDING, lineHeight,
       std::move(table.streamingFragmentRows), table.blockStyle.leftInset(), currentPageNextY);
@@ -1226,12 +1428,19 @@ bool ChapterHtmlSlimParser::streamCurrentTableRow() {
     const auto& sourceCell = row.cells[cellIndex];
     auto& destCell = fragmentRow.cells[cellIndex];
     destCell.isHeader = sourceCell.isHeader;
+    bool lineValid = true;
     if (sourceCell.text &&
-        !sourceCell.text->layoutAndExtractLinesPreservingSource(
-            renderer, fontId,
-            TableColumnLayout::innerWidth(tableWidth, columnCount, static_cast<uint8_t>(cellIndex), 1,
-                                          TABLE_CELL_PADDING),
-            [&destCell](const std::shared_ptr<TextBlock>& textBlock) { destCell.lines.push_back(textBlock); }, true)) {
+        (!sourceCell.text->layoutAndExtractLinesPreservingSource(
+             renderer, fontId,
+             TableColumnLayout::innerWidth(tableWidth, columnCount, static_cast<uint8_t>(cellIndex), 1,
+                                           TABLE_CELL_PADDING),
+             [this, &destCell, &lineValid, lineHeight](const std::shared_ptr<TextBlock>& textBlock,
+                                                       const std::vector<InlineObjectPlacement>& objects) {
+               auto& line = destCell.lines.emplace_back(textBlock);
+               if (!line.setInlineMath(objects, lineHeight, renderer.getFontAscenderSize(fontId))) lineValid = false;
+             },
+             true) ||
+         !lineValid)) {
       fallbackStreamingTableToParagraphs("cell layout failed");
       return !lowMemoryAbort;
     }
@@ -1243,7 +1452,7 @@ bool ChapterHtmlSlimParser::streamCurrentTableRow() {
       fallbackStreamingTableToParagraphs("cell has too many lines");
       return !lowMemoryAbort;
     }
-    const uint32_t cellHeight = std::max<size_t>(1, destCell.lines.size()) * lineHeight + TABLE_CELL_PADDING * 2;
+    const uint32_t cellHeight = destCell.contentHeight(lineHeight) + TABLE_CELL_PADDING * 2;
     if (cellHeight > viewportHeight) {
       fallbackStreamingTableToParagraphs("row exceeds viewport");
       return !lowMemoryAbort;
@@ -1308,6 +1517,7 @@ bool ChapterHtmlSlimParser::flushCompactTableFragment() {
   const uint16_t width =
       horizontalInset < viewportWidth ? static_cast<uint16_t>(viewportWidth - horizontalInset) : viewportWidth;
   const uint16_t lineHeight = renderer.getLineHeight(fontId) * lineCompression;
+  if (!bindTableMath(compactFragmentRows)) return false;
   auto fragment =
       makeUniqueNoThrow<PageTableFragment>(width, compactFragmentColumnCount, TABLE_CELL_PADDING, lineHeight,
                                            std::move(compactFragmentRows), style.leftInset(), currentPageNextY);
@@ -1332,8 +1542,7 @@ bool ChapterHtmlSlimParser::flushCompactTableFragment() {
   return true;
 }
 
-bool ChapterHtmlSlimParser::emitCompactTableRow(TableFragmentRow& row,
-                                                std::vector<std::shared_ptr<TextBlock>>& flatLines,
+bool ChapterHtmlSlimParser::emitCompactTableRow(TableFragmentRow& row, std::vector<TableCellLine>& flatLines,
                                                 const std::vector<FootnoteEntry>& footnotes,
                                                 const uint32_t rowVisibleOffset, const uint8_t fragmentColumnCount,
                                                 const bool flatten) {
@@ -1347,10 +1556,10 @@ bool ChapterHtmlSlimParser::emitCompactTableRow(TableFragmentRow& row,
 
   if (flatten) {
     if (!flushCompactTableFragment()) return false;
-    for (const auto& line : flatLines) {
-      if (!line) continue;
-      if (!currentPage->elements.empty() &&
-          currentPageNextY + renderer.getLineHeight(fontId) * lineCompression > viewportHeight) {
+    const int defaultHeight = renderer.getLineHeight(fontId) * lineCompression;
+    for (auto& line : flatLines) {
+      const int height = line.height(defaultHeight);
+      if (!currentPage->elements.empty() && currentPageNextY + height > viewportHeight) {
         completeCurrentPage();
         completedPageCount++;
         stopPreviewIfPageLimitReached();
@@ -1358,16 +1567,27 @@ bool ChapterHtmlSlimParser::emitCompactTableRow(TableFragmentRow& row,
         if (previewStopRequested) return true;
         if (!startNewPage("compact table paragraph page break")) return false;
       }
-      auto pageLine = makeUniqueNoThrow<PageLine>(line, style.leftInset(), currentPageNextY);
-      if (!pageLine) {
-        LOG_ERR("EHP", "Failed to create compact table paragraph line");
-        lowMemoryAbort = true;
-        return false;
+      if (line.text && !line.text->isEmpty()) {
+        auto pageLine = makeUniqueNoThrow<PageLine>(line.text, style.leftInset(), currentPageNextY + line.textTop());
+        if (!pageLine) {
+          LOG_ERR("EHP", "Failed to create compact table paragraph line");
+          lowMemoryAbort = true;
+          return false;
+        }
+        currentPage->elements.push_back(std::move(pageLine));
       }
-      currentPage->elements.push_back(std::move(pageLine));
+      if (!bindTableMath(line)) return false;
+      if (line.math) {
+        for (size_t i = 0; i < line.math->count; ++i) {
+          auto& formula = line.math->placements[i].drawing;
+          formula->xPos += style.leftInset();
+          formula->yPos += currentPageNextY;
+          currentPage->elements.push_back(std::move(formula));
+        }
+      }
       setCurrentPageVisibleOffset(rowVisibleOffset);
       markCurrentPageFromCurrentElement();
-      currentPageNextY = static_cast<int16_t>(currentPageNextY + renderer.getLineHeight(fontId) * lineCompression);
+      currentPageNextY = static_cast<int16_t>(currentPageNextY + height);
     }
     for (const auto& footnote : footnotes) {
       currentPage->addFootnote(footnote.number, footnote.href, footnote.linkId);
@@ -1482,12 +1702,18 @@ void ChapterHtmlSlimParser::emitBufferedTableAsFragments(BufferedTable& table) {
       destCell.isHeader = sourceCell.isHeader;
 
       if (sourceCell.text) {
+        bool lineValid = true;
         if (!sourceCell.text->layoutAndExtractLinesPreservingSource(
                 renderer, fontId,
                 TableColumnLayout::innerWidth(tableWidth, columnCount, static_cast<uint8_t>(colIndex), 1,
                                               TABLE_CELL_PADDING),
-                [&destCell](const std::shared_ptr<TextBlock>& textBlock) { destCell.lines.push_back(textBlock); },
-                true)) {
+                [this, &destCell, &lineValid, lineHeight](const std::shared_ptr<TextBlock>& textBlock,
+                                                          const std::vector<InlineObjectPlacement>& objects) {
+                  auto& line = destCell.lines.emplace_back(textBlock);
+                  if (!line.setInlineMath(objects, lineHeight, renderer.getFontAscenderSize(fontId))) lineValid = false;
+                },
+                true) ||
+            !lineValid) {
           LOG_DBG("EHP", "Table layout fallback: cell text layout failed");
           return false;
         }
@@ -1504,8 +1730,7 @@ void ChapterHtmlSlimParser::emitBufferedTableAsFragments(BufferedTable& table) {
         return false;
       }
 
-      const uint32_t cellLineCount = std::max<size_t>(1, destCell.lines.size());
-      const uint32_t cellHeight = cellLineCount * lineHeight + TABLE_CELL_PADDING * 2;
+      const uint32_t cellHeight = destCell.contentHeight(lineHeight) + TABLE_CELL_PADDING * 2;
       if (cellHeight > viewportHeight) {
         LOG_DBG("EHP", "Table layout fallback: row height %lu exceeds viewport %u",
                 static_cast<unsigned long>(cellHeight), viewportHeight);
@@ -1602,6 +1827,7 @@ void ChapterHtmlSlimParser::emitBufferedTableAsFragments(BufferedTable& table) {
         nextRowIndex++;
       }
 
+      if (!bindTableMath(fragmentRows)) return;
       auto fragment =
           makeUniqueNoThrow<PageTableFragment>(tableWidth, segment.columnCount, TABLE_CELL_PADDING, lineHeight,
                                                std::move(fragmentRows), table.blockStyle.leftInset(), currentPageNextY);
@@ -1711,7 +1937,7 @@ void ChapterHtmlSlimParser::flushMalformedPartialContent() {
       if (currentCompactTable->hasActiveRow()) {
         currentCompactTable->setFlattened();
         TableFragmentRow row;
-        std::vector<std::shared_ptr<TextBlock>> flatLines;
+        std::vector<TableCellLine> flatLines;
         std::vector<FootnoteEntry> rowFootnotes;
         rowFootnotes.reserve(Page::MAX_FOOTNOTES_PER_PAGE);
         uint32_t rowVisibleOffset = visibleTextOffset;
@@ -1817,6 +2043,7 @@ bool ChapterHtmlSlimParser::appendMalformedMarkupWarningPage() {
 
 void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
+  self->mathNamespaces.enter(atts);
   if (self->isScanningForPreviewAnchor()) {
     if (self->handlePreviewScanStart(atts)) {
       return;
@@ -1826,6 +2053,23 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     return;
   }
   if (self->shouldAbortForLowMemory("element start")) {
+    return;
+  }
+
+  const auto mathName = self->mathNamespaces.localMathName(name);
+  if (self->mathDepth != 0) {
+    ++self->mathDepth;
+    if (self->mathAnnotationDepth != 0) return;
+    if (mathName == "annotation" || mathName == "annotation-xml") {
+      const char* encoding = getAttribute(atts, "encoding");
+      if (mathName == "annotation" || !encoding ||
+          (strcmp(encoding, "MathML-Presentation") != 0 &&
+           strcmp(encoding, "application/mathml-presentation+xml") != 0)) {
+        self->mathAnnotationDepth = self->mathDepth;
+        return;
+      }
+    }
+    if (self->mathCapture) self->mathCapture->start(mathName, atts);
     return;
   }
 
@@ -1913,8 +2157,9 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   // before tag-specific branches emit any content or metadata.
   CssStyle cssStyle;
   if (self->cssParser) {
-    cssStyle = self->usesSimpleCssLookup() ? self->cssParser->resolveStyle(name, classAttr)
-                                           : self->cssParser->resolveStyle(name, classAttr, self->ancestorStack_);
+    const char* styleTag = mathName == "math" ? "math" : name;
+    cssStyle = self->usesSimpleCssLookup() ? self->cssParser->resolveStyle(styleTag, classAttr)
+                                           : self->cssParser->resolveStyle(styleTag, classAttr, self->ancestorStack_);
     if (!styleAttr.empty()) {
       CssStyle inlineStyle = CssParser::parseInlineStyle(styleAttr);
       cssStyle.applyOver(inlineStyle);
@@ -1966,6 +2211,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   // Skip elements with display:none before all fast paths (tables, links, etc.).
   if (cssStyle.hasDisplay() && cssStyle.display == CssDisplay::None) {
     self->skipCurrentElement();
+    return;
+  }
+  if (mathName == "math" && self->tableDepth <= 1 && !self->collectingRubyText) {
+    self->startMath(atts, cssStyle);
     return;
   }
 
@@ -3215,6 +3464,13 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       self->visibleTextOffset++;
     }
   }
+  if (self->mathDepth != 0) {
+    if (countReferenceCharacters) self->consumeReferenceCharacters(s, len);
+    if (self->mathCapture && self->mathAnnotationDepth == 0) {
+      self->mathCapture->characters({s, static_cast<size_t>(len)});
+    }
+    return;
+  }
 
   // Collect ruby text instead of normal word processing
   if (self->collectingRubyText) {
@@ -3431,6 +3687,7 @@ void XMLCALL ChapterHtmlSlimParser::defaultHandlerExpand(void* userData, const X
 
 void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* name) {
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
+  self->mathNamespaces.leave();
   if (self->isScanningForPreviewAnchor()) {
     if (self->depth > 0) {
       self->depth -= 1;
@@ -3441,6 +3698,15 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
     return;
   }
   if (self->lowMemoryAbort) {
+    return;
+  }
+  if (self->mathDepth != 0) {
+    if (self->mathAnnotationDepth != 0) {
+      if (self->mathAnnotationDepth == self->mathDepth) self->mathAnnotationDepth = 0;
+    } else if (self->mathCapture) {
+      self->mathCapture->end();
+    }
+    if (--self->mathDepth == 0) self->finishMath();
     return;
   }
 
@@ -3590,7 +3856,7 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
         self->currentCompactTable->setFlattened();
       }
       TableFragmentRow row;
-      std::vector<std::shared_ptr<TextBlock>> flatLines;
+      std::vector<TableCellLine> flatLines;
       std::vector<FootnoteEntry> rowFootnotes;
       rowFootnotes.reserve(Page::MAX_FOOTNOTES_PER_PAGE);
       uint32_t rowVisibleOffset = self->visibleTextOffset;
@@ -3852,6 +4118,10 @@ void ChapterHtmlSlimParser::releaseInputFile() {
 
 bool ChapterHtmlSlimParser::beginParse() {
   pendingInlineImages.clear();
+  pendingMath.reset();
+  mathCapture.reset();
+  mathNamespaces = {};
+  mathDepth = 0;
   nextInlineImageId = 1;
   malformedMarkupTruncated = false;
   htmlEnded_ = false;
@@ -3995,6 +4265,10 @@ ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
 
 void ChapterHtmlSlimParser::abortParse() {
   pendingInlineImages.clear();
+  pendingMath.reset();
+  mathCapture.reset();
+  mathNamespaces = {};
+  mathDepth = 0;
   if (activeParser) {
     destroyXmlParser(activeParser);
     activeParser = nullptr;
@@ -4024,6 +4298,10 @@ bool ChapterHtmlSlimParser::finishParse() {
 
   if (malformedMarkupTruncated) {
     LOG_DBG("EHP", "Malformed markup encountered; finalizing partial chapter content");
+    if (mathDepth != 0) {
+      mathDepth = 0;
+      emitMathFallback(mathCapture.get());
+    }
     flushMalformedPartialContent();
     if (lowMemoryAbort) {
       parseArena_.release();
@@ -4032,6 +4310,8 @@ bool ChapterHtmlSlimParser::finishParse() {
       return false;
     }
   }
+  mathCapture.reset();
+  mathNamespaces = {};
 
   // Process last page if there is still text
   if (isPreviewBuild() && !previewAnchorFound) {
@@ -4063,6 +4343,7 @@ bool ChapterHtmlSlimParser::finishParse() {
     stopPreviewIfPageLimitReached();
   }
   currentPage.reset();
+  pendingMath.reset();
 
   if (malformedMarkupTruncated && !appendMalformedMarkupWarningPage()) {
     LOG_ERR("EHP", "Failed to append malformed markup warning page");
@@ -4102,15 +4383,17 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const
     return;
   }
 
-  const auto& lineImages = currentTextBlock->currentLineImages();
-  const int textHeight = effectiveLineHeight() + line->getRubyShift(renderer.getFontAscenderSize(currentTextFontId()));
+  const auto& lineObjects = currentTextBlock->currentLineObjects();
+  const int ascender = renderer.getFontAscenderSize(currentTextFontId());
+  const int rubyShift = line->getRubyShift(ascender);
+  const int textHeight = effectiveLineHeight() + rubyShift;
+  const auto metrics = measureInlineLine(lineObjects, textHeight, ascender + rubyShift);
   if (line->getBlockStyle().fontSize) {
     auto style = line->getBlockStyle();
     style.lineHeight = static_cast<uint16_t>(textHeight);
     line->setBlockStyle(style);
   }
-  int lineHeight = textHeight;
-  for (const auto& image : lineImages) lineHeight = std::max(lineHeight, static_cast<int>(image.height));
+  const int lineHeight = metrics.height;
 
   if (!currentPage) {
     if (!startNewPage("line layout")) {
@@ -4145,7 +4428,7 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const
   }
 
   // Track cumulative words to retire links after laying out their final word.
-  wordsExtractedInBlock += line->wordCount() + lineImages.size();
+  wordsExtractedInBlock += line->wordCount() + lineObjects.size();
   auto footnoteIt = pendingFootnotes.begin();
   while (footnoteIt != pendingFootnotes.end() && footnoteIt->first <= wordsExtractedInBlock) {
     currentPage->addFootnote(footnoteIt->second.number, footnoteIt->second.href, footnoteIt->second.linkId);
@@ -4157,9 +4440,7 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const
   // Apply horizontal left inset (margin + padding) as x position offset
   const int16_t xOffset = line->getBlockStyle().leftInset();
   if (!line->isEmpty()) {
-    // A taller inline image raises the line's top edge; keep the text beside
-    // its lower edge instead of leaving it stranded above the image.
-    auto pageLine = makeUniqueNoThrow<PageLine>(line, xOffset, currentPageNextY + lineHeight - textHeight);
+    auto pageLine = makeUniqueNoThrow<PageLine>(line, xOffset, currentPageNextY + metrics.textTop);
     if (!pageLine) {
       LOG_ERR("EHP", "Failed to create PageLine");
       lowMemoryAbort = true;
@@ -4167,7 +4448,19 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line, const
     }
     currentPage->elements.push_back(std::move(pageLine));
   }
-  for (const auto& image : lineImages) {
+  for (const auto& image : lineObjects) {
+    if (image.kind == InlineObjectKind::Math) {
+      if (!pendingMath || image.id >= pendingMath->size() || !(*pendingMath)[image.id]) {
+        LOG_ERR("MML", "Missing inline drawing %u", image.id);
+        lowMemoryAbort = true;
+        return;
+      }
+      auto& formula = (*pendingMath)[image.id];
+      formula->xPos = xOffset + image.x;
+      formula->yPos = currentPageNextY + metrics.baseline - image.ascent;
+      currentPage->elements.push_back(std::move(formula));
+      continue;
+    }
     const auto it = std::find_if(pendingInlineImages.begin(), pendingInlineImages.end(),
                                  [&image](const PendingInlineImage& pending) { return pending.id == image.id; });
     if (it == pendingInlineImages.end()) {

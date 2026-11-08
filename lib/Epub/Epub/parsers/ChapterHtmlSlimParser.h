@@ -21,6 +21,7 @@
 #include "Epub/blocks/TextBlock.h"
 #include "Epub/css/CssParser.h"
 #include "Epub/css/CssStyle.h"
+#include "Epub/math/MathCapture.h"
 #include "Epub/tables/CompactTableLayout.h"
 
 class GfxRenderer;
@@ -107,6 +108,15 @@ class ChapterHtmlSlimParser {
   };
   std::vector<PendingInlineImage> pendingInlineImages;
   uint16_t nextInlineImageId = 1;
+  mathml::NamespaceScope mathNamespaces;
+  std::unique_ptr<mathml::Capture> mathCapture;
+  using PendingMath = std::array<std::unique_ptr<PageMath>, 16>;
+  std::unique_ptr<PendingMath> pendingMath;
+  uint32_t mathDepth = 0;
+  uint32_t mathAnnotationDepth = 0;
+  uint32_t mathVisibleOffset = 0;
+  uint32_t mathReferenceOffset = 0;
+  bool mathDisplay = false;
   bool lowMemoryImageFallback = false;
   bool lowMemoryAbort = false;
   bool attemptedTextLayoutFontCacheRelease = false;
@@ -293,6 +303,12 @@ class ChapterHtmlSlimParser {
   static void applySmallCapsToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyVerticalAlignToEntry(StyleStackEntry& entry, const CssStyle& css);
   void emitHorizontalRule(const BlockStyle& blockStyle);
+  void startMath(const XML_Char** atts, const CssStyle& cssStyle);
+  void finishMath();
+  bool placeMath(mathml::Drawing drawing, bool display);
+  void emitMathFallback(const mathml::Capture* capture);
+  bool bindTableMath(TableCellLine& line);
+  bool bindTableMath(std::span<TableFragmentRow> rows);
   void finalizeCurrentTableCell();
   void emitBufferedTableAsParagraphs(BufferedTable& table);
   void emitBufferedTableAsFragments(BufferedTable& table);
@@ -301,7 +317,7 @@ class ChapterHtmlSlimParser {
   void emitStreamingTableRowsAsParagraphs(BufferedTable& table);
   void finishStreamingTable(BufferedTable& table);
   bool flushCompactTableFragment();
-  bool emitCompactTableRow(TableFragmentRow& row, std::vector<std::shared_ptr<TextBlock>>& flatLines,
+  bool emitCompactTableRow(TableFragmentRow& row, std::vector<TableCellLine>& flatLines,
                            const std::vector<FootnoteEntry>& footnotes, uint32_t visibleTextOffset,
                            uint8_t fragmentColumnCount, bool flatten);
   void finishCompactTable();
