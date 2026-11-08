@@ -6,12 +6,39 @@ on; for everything inherited from upstream, see the
 [CrossInk changelog](https://github.com/uxjulia/CrossInk/blob/main/CHANGELOG.md).
 
 ## Unreleased
+=======
+## [v1.6.1+bookorbit.6] - 2026-11-07
+
+Based on CrossInk v1.6.1.
+
+### Fixed
+
+- With the BookOrbit theme, closing the panel pulled down from the top of the Home screen no longer freezes the X4 Pro and Sticky until a restart. The panel stayed on screen and the reader stopped responding to touch and buttons ([#107](https://github.com/agosez/CrossInk-Bookorbit/issues/107)).
+- On the X3, the frame around the selected book on the BookOrbit theme's Library page no longer runs into the frame of its shelf. The shelf covers are a little smaller to make room, and the next sync downloads them again at their new size ([#108](https://github.com/agosez/CrossInk-Bookorbit/issues/108)).
+
+## [v1.6.1+bookorbit.5] - 2026-11-06
 
 Based on CrossInk v1.6.1.
 
 ### Added
 
 - EPUBs can display inline and standalone MathML equations using a bundled math font.
+=======
+- A BookOrbit catalog book list can be sorted and filtered by reading status. Sort offers the Library's orders that BookOrbit supports (date added, title, author by last name, recently read, series), with A-Z or Z-A first in the list as in the Library; Filter shows all books, or only unread, reading or finished ones. On the X3 and X4, Left sorts and Right filters while Up and Down move through the list, as in the Library; on touch devices, two buttons in the header do the same. The server sorts and filters, so a long list still pages exactly, and the header shows the filter and how many books match. The choice applies to the list you are in, and comes back after a download on the X3 and X4.
+- BookOrbit catalog book lists are split into sections, as the Library is when its List View is Expanded: by first letter when sorted by title or author, by day when sorted by date added, and by series when sorted by series. The sort picker can switch the List View between Expanded and Compact, the same setting the Library uses.
+- The BookOrbit catalog lists your Want to Read shelf, the books you most recently marked as want to read in BookOrbit, as its KOReader plugin shows them. It appears when your server offers that shelf, which holds a dozen books at most.
+- Settings > System > Include Release Candidates lets Check for Updates offer this fork's release candidates, the test builds published ahead of a release. It is off by default. When on, the reader is offered whichever is newer, the latest candidate or the latest release, so it moves from one candidate to the next and then to the final release. Turning it back off keeps the installed candidate until a newer release comes out, as the updater never installs an older version.
+- A new **BookOrbit** theme turns Home into pages of tiles modeled on BookOrbit's dashboard: the current book, your streak, the week's reading, your yearly goal and your other books; then the catalog's Discover and Recently Added shelves; then a year of reading, a finish forecast and your totals. Confirm resumes your book in one press. Opening Home never waits on the network: Sync on Sleep or the BookOrbit tile refresh the server's data, and your reading on the device counts on Home straight away until the server's numbers include it. Without an account the theme runs on your own numbers.
+- Reading time per day is now recorded on the X4 as well, once its clock has been set over Wi-Fi. The X4 has no clock chip, so its streak and calendar statistics used to stay empty.
+
+### Fixed
+
+- Downloading a book from the BookOrbit catalog or an OPDS server no longer fails after about 100 KB with "Download failed" on the X3 and X4 when the server sits behind Caddy, Traefik or another proxy written in Go. These servers start with small pieces of secure data and send larger ones as the transfer goes on, and the reader made room for each new size until no large enough block of memory was left. It now sets aside room for the largest piece as the connection opens ([#96](https://github.com/agosez/CrossInk-Bookorbit/issues/96)).
+- Browsing past the second page of a BookOrbit catalog listing, or opening a book found there, no longer fails with "Could not reach BookOrbit" on the X3 and X4. Every page shown used to stay in memory until too little was left for a secure connection. The catalog now keeps only the pages around the one on screen and reloads the others from the SD card, and on the X3 and X4 it opens after a quick restart, as the OPDS browser does ([#96](https://github.com/agosez/CrossInk-Bookorbit/issues/96)).
+
+### Changed
+
+- Back from a book list opened from Authors, Series, Collections, Libraries or SmartScopes returns to the entry you opened it from, instead of the top of that list.
 
 ## [v1.6.1+bookorbit.4] - 2026-10-30
 

@@ -13,6 +13,7 @@
 #include "activities/Activity.h"
 #include "activities/reader/BookReadingStats.h"
 #include "activities/reader/GlobalReadingStats.h"
+#include "components/BookOrbitHomeUi.h"
 #include "components/CoverGridHomeUi.h"
 #include "components/OptionPopup.h"
 #include "util/ButtonNavigator.h"
@@ -31,6 +32,7 @@ class HomeActivity final : public Activity {
  private:
   ButtonNavigator buttonNavigator;
   std::unique_ptr<CoverGridHomeUi> coverGridUi;
+  std::unique_ptr<BookOrbitHomeUi> bookOrbitUi;
   bool gridHasContinueReading = false;
   int selectorIndex = 0;
   int lastCarouselBookIndex = 0;  // remembered position when leaving carousel row
@@ -126,10 +128,18 @@ class HomeActivity final : public Activity {
   int getVisibleRecentBookCount() const;
   bool canSwapHomeBook() const;
   void showNextRecentBookOnHome();
-  void updateHighlightedBookContext(bool allowChapterTitleRead = true);
+  // Whether the caller already holds the (non-recursive) RenderLock, as
+  // ActivityManager does around onFrontlightPanelClosed().
+  enum class RenderLockHeld : uint8_t { No, Yes };
+  void updateHighlightedBookContext(bool allowChapterTitleRead = true, RenderLockHeld lockHeld = RenderLockHeld::No);
   void loadRecentBooks(int maxBooks);
   void loadCoverGridThumbnails();
   void activateCoverGridSelection();
+  void beginBookOrbitUi();
+  bool waitingForInitialFrontRelease();
+  void loopBookOrbitHome();
+  void activateBookOrbitStop(const BookOrbitHomeUi::Stop& stop);
+  void loadBookOrbitThumbnails();
   void loadAllBookStats();
   void loadRecentCovers(int coverHeight);
 
